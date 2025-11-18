@@ -1,5 +1,4 @@
-# .github/workflows/docker-publish.yml
-name: Build and Push Docker Image to GHCR
+name: GHCR
 
 on:
   push:
@@ -22,12 +21,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # =======================================================
-      # [修复点] 这里不再用 ${{ github.repository }} (你的仓库)
-      # 而是直接指定去原作者的仓库找文件 (Storeanthony/Cloud-Studio)
-      # 如果你的源头不是这个，请把下面的 "Storeanthony/Cloud-Studio" 
-      # 换成你 fork 的那个项目的名字
-      # =======================================================
       - name: Get Camoufox Download URL
         id: get_camoufox_url
         run: |
