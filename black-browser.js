@@ -189,11 +189,15 @@ class RequestProcessor {
     const queryParams = new URLSearchParams(requestSpec.query_params);
 
 
-    if (pathSegment.includes("-search:")) {
-      pathSegment = pathSegment.replace("-search:", ":");
-      Logger.output(`检测到 "-search" 后缀，已修正API路径为: ${pathSegment}`);
-    }
-
+    // 移除所有自定义后缀，以便将干净的 URL 发送给 Google
+    const suffixes = ["-search", "-maxthinking", "-nothinking"];
+    suffixes.forEach(suffix => {
+      if (pathSegment.includes(suffix + ":")) {
+        pathSegment = pathSegment.replace(suffix + ":", ":");
+        Logger.output(`检测到 "${suffix}" 后缀，已修正API路径。`);
+      }
+    });
+    
     if (requestSpec.streaming_mode === "fake") {
       Logger.output("假流式模式激活，正在修改请求...");
       if (pathSegment.includes(":streamGenerateContent")) {
@@ -228,19 +232,83 @@ class RequestProcessor {
       try {
         let bodyObj = JSON.parse(requestSpec.body);
 
-        // --- 模块0：根据 "-search" 后缀智能联网 ---
+        // --- 模块0：加入 "-search"等模式 ---
         if (requestSpec.path.includes("-search:")) {
           if (!bodyObj.tools) {
-            // =================================================================
-            // ===                 *** 此处代码已修改 ***                 ===
-            // =================================================================
             bodyObj.tools = [{
               "google_search": {} // 使用新的工具名称
             }];
             Logger.output("✅ 检测到 '-search' 后缀，已为请求开启联网模式。");
           }
         }
+           
+        // --- 模块1：根据模型版本和后缀，智能处理思考模式 ---
+        const isGemini3 = path.includes("gemini-3");
+        const hasThinkingSuffix = path.includes("-maxthinking") || path.includes("-nothinking");
 
+        if (hasThinkingSuffix) {
+          const ensureThinkingConfig = () => {
+            if (!bodyObj.tool_config) bodyObj.tool_config = {};
+            if (!bodyObj.tool_config.thinking_config) bodyObj.tool_config.thinking_config = {};
+          };
+          ensureThinkingConfig();
+
+          if (isGemini3) {
+            // Gemini 3 系列使用 thinkingLevel
+            if (path.includes("-maxthinking")) {
+              bodyObj.tool_config.thinking_config.thinkingLevel = "high";
+              Logger.output("✅ Gemini 3: 已设置思考级别为 'high'。");
+            } else { // -nothinking
+              bodyObj.tool_config.thinking_config.thinkingLevel = "low";
+              Logger.output("✅ Gemini 3: 已设置思考级别为 'low'。");
+            }
+          } else {
+            // Gemini 2.5 及更早版本使用 thinking_token_limit，并区分 pro 和 flash
+            const isFlashModel = path.includes("2.5-flash");
+            const isProModel = path.includes("2.5-pro");
+            
+            if (path.includes("-maxthinking")) {
+              if (isFlashModel) {
+                bodyObj.tool_config.thinking_config.thinking_token_limit = 24000;
+                Logger.output("✅ Gemini 2.5 Flash: 最大思考Token (24576)。");
+              }
+              
+              if (isProModel) {
+                bodyObj.tool_config.thinking_config.thinking_token_limit = 32000;
+                Logger.output("✅ Gemini 2.5 Pro: 最大思考Token (32768)。");
+              }
+              
+            } else { // -nothinking
+              if (isFlashModel) {
+                bodyObj.tool_config.thinking_config.thinking_token_limit = 0;
+                Logger.output("✅ Gemini 2.5 Flash: 已禁用思考Token (0)。");
+              } 
+              if (isProModel) {
+                bodyObj.tool_config.thinking_config.thinking_token_limit = 128;
+                Logger.output("✅ Gemini 2.5 Pro: 已设置最小思考Token (128)。");
+              }
+            }
+          }
+        }
+        
+        const ensureThinkingConfig = () => {
+          if (!bodyObj.tool_config) bodyObj.tool_config = {};
+          if (!bodyObj.tool_config.thinking_config) bodyObj.tool_config.thinking_config = {};
+        };
+
+        if (requestSpec.path.includes("-maxthinking:")) {
+          ensureThinkingConfig();
+          // 设置最大思考 token 数量
+          bodyObj.tool_config.thinking_config.thinking_token_limit = 32000;
+          Logger.output("✅ 检测到 '-maxthinking' 后缀，已设置最大思考Token。");
+
+        } else if (requestSpec.path.includes("-nothinking:")) {
+          ensureThinkingConfig();
+          // 设置零思考 token 数量
+          bodyObj.tool_config.thinking_config.thinking_token_limit = 100;
+          Logger.output("✅ 检测到 '-nothinking' 后缀，已禁用思考Token。");
+        }
+        
         // --- 模块1：智能过滤 ---
         const isImageModel =
           requestSpec.path.includes("-image-") ||
