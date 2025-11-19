@@ -275,11 +275,11 @@ class RequestProcessor {
           if (isGemini3) {
             // Gemini 3 系列使用 thinkingLevel
             if (path.includes("-maxthinking")) {
-              bodyObj.tool_config.thinking_config.thinking_token_limit = 32000;
-              Logger.output("✅ Gemini 2.5 Pro: 最大思考Token (32768)。");
+              bodyObj.tool_config.thinking_config.thinkingLevel = "high";
+              Logger.output("✅ Gemini 3: 已设置思考级别为 'high'。");
             } else { // -nothinking
-              bodyObj.tool_config.thinking_config.thinking_token_limit = 128;
-              Logger.output("✅ Gemini 2.5 Pro: 已设置最小思考Token (128)。");
+              bodyObj.tool_config.thinking_config.thinkingLevel = "low";
+              Logger.output("✅ Gemini 3: 已设置思考级别为 'low'。");
             }
           } else {
             // Gemini 2.5 及更早版本使用 thinking_token_limit，并区分 pro 和 flash
@@ -447,7 +447,6 @@ class ProxySystem extends EventTarget {
         if (done) break;
         const chunk = textDecoder.decode(value, { stream: true });
 
-        // 始终以 requestSpec 中的 streaming_mode 为准，因为它可能被动态修改
         if (requestSpec.streaming_mode === "real") {
           this._transmitChunk(chunk, operationId);
         } else {
