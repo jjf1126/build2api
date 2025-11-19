@@ -188,8 +188,12 @@ class RequestProcessor {
       : requestSpec.path;
     const queryParams = new URLSearchParams(requestSpec.query_params);
 
-    // 新增：检测并处理 "假流式/" 前缀
-    requestSpec.streaming_mode = "real"; 
+    // 1. 设定安全的默认值
+    if (!requestSpec.streaming_mode) {
+      requestSpec.streaming_mode = "real";
+    }
+
+    // 2. 检查用户是否通过前缀强制要求假流式
     if (pathSegment.includes("/假流式/")) {
       // 移除前缀，得到干净的模型路径
       pathSegment = pathSegment.replace("/假流式/", "/");
@@ -306,24 +310,6 @@ class RequestProcessor {
           }
         }
         
-        const ensureThinkingConfig = () => {
-          if (!bodyObj.tool_config) bodyObj.tool_config = {};
-          if (!bodyObj.tool_config.thinking_config) bodyObj.tool_config.thinking_config = {};
-        };
-
-        if (requestSpec.path.includes("-maxthinking:")) {
-          ensureThinkingConfig();
-          // 设置最大思考 token 数量
-          bodyObj.tool_config.thinking_config.thinking_token_limit = 32000;
-          Logger.output("✅ 检测到 '-maxthinking' 后缀，已设置最大思考Token。");
-
-        } else if (requestSpec.path.includes("-nothinking:")) {
-          ensureThinkingConfig();
-          // 设置零思考 token 数量
-          bodyObj.tool_config.thinking_config.thinking_token_limit = 100;
-          Logger.output("✅ 检测到 '-nothinking' 后缀，已禁用思考Token。");
-        }
-        
         // --- 模块1：智能过滤 ---
         const isImageModel =
           requestSpec.path.includes("-image-") ||
@@ -433,24 +419,20 @@ class ProxySystem extends EventTarget {
 
   async _processProxyRequest(requestSpec) {
     const operationId = requestSpec.request_id;
-    const mode = requestSpec.streaming_mode || "fake";
     
     try {
       if (this.requestProcessor.cancelledOperations.has(operationId)) {
         throw new DOMException("The user aborted a request.", "AbortError");
       }
-      const { responsePromise } = this.requestProcessor.execute(
-        requestSpec,
-        operationId
-      );
-      const response = await responsePromise;
+      
+      const response = await this.requestProcessor.execute(requestSpec, operationId);
+      
       if (this.requestProcessor.cancelledOperations.has(operationId)) {
         throw new DOMException("The user aborted a request.", "AbortError");
       }
 
       this._transmitHeaders(response, operationId);
       
-      // 如果是HEAD请求，可能没有body，直接结束
       if (!response.body) {
           this._transmitStreamEnd(operationId);
           return;
@@ -463,17 +445,17 @@ class ProxySystem extends EventTarget {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-
         const chunk = textDecoder.decode(value, { stream: true });
 
-        if (mode === "real") {
+        // 始终以 requestSpec 中的 streaming_mode 为准，因为它可能被动态修改
+        if (requestSpec.streaming_mode === "real") {
           this._transmitChunk(chunk, operationId);
         } else {
           fullBody += chunk;
         }
       }
 
-      if (mode === "fake") {
+      if (requestSpec.streaming_mode !== "real") {
         this._transmitChunk(fullBody, operationId);
       }
 
