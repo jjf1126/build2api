@@ -188,15 +188,29 @@ class RequestProcessor {
       : requestSpec.path;
     const queryParams = new URLSearchParams(requestSpec.query_params);
 
+    // 新增：检测并处理 "假流式/" 前缀
+    if (pathSegment.includes("/假流式/")) {
+      // 移除前缀，得到干净的模型路径
+      pathSegment = pathSegment.replace("/假流式/", "/");
+      // 强制设定为假流式模式，这将覆盖来自服务器的任何设置
+      requestSpec.streaming_mode = "fake"; 
+      Logger.output(`检测到 "假流式/" 前缀，已激活假流式模式。修正路径为: ${pathSegment}`);
+    }
 
-    // 移除所有自定义后缀，以便将干净的 URL 发送给 Google
-    const suffixes = ["-search", "-maxthinking", "-nothinking"];
-    suffixes.forEach(suffix => {
-      if (pathSegment.includes(suffix + ":")) {
-        pathSegment = pathSegment.replace(suffix + ":", ":");
-        Logger.output(`检测到 "${suffix}" 后缀，已修正API路径。`);
+    // 增强的后缀移除逻辑，可以处理组合后缀
+    const [modelPart, actionPart] = pathSegment.split(":");
+    if (actionPart !== undefined) { // 确保路径中包含 ":"
+      const originalModelPart = modelPart;
+      const cleanedModelPart = originalModelPart
+        .replace("-search", "")
+        .replace("-maxthinking", "")
+        .replace("-nothinking", "");
+
+      if (originalModelPart !== cleanedModelPart) {
+        pathSegment = `${cleanedModelPart}:${actionPart}`;
+        Logger.output(`检测到自定义后缀，已修正API路径为: ${pathSegment}`);
       }
-    });
+    }
     
     if (requestSpec.streaming_mode === "fake") {
       Logger.output("假流式模式激活，正在修改请求...");
@@ -231,7 +245,7 @@ class RequestProcessor {
     ) {
       try {
         let bodyObj = JSON.parse(requestSpec.body);
-
+        const path = requestSpec.path;
         // --- 模块0：加入 "-search"等模式 ---
         if (requestSpec.path.includes("-search:")) {
           if (!bodyObj.tools) {
