@@ -425,7 +425,8 @@ class ProxySystem extends EventTarget {
         throw new DOMException("The user aborted a request.", "AbortError");
       }
       
-      const response = await this.requestProcessor.execute(requestSpec, operationId);
+      const { responsePromise, cancelTimeout } = this.requestProcessor.execute(requestSpec, operationId);
+      const response = await responsePromise;
       
       if (this.requestProcessor.cancelledOperations.has(operationId)) {
         throw new DOMException("The user aborted a request.", "AbortError");
@@ -441,10 +442,17 @@ class ProxySystem extends EventTarget {
       const reader = response.body.getReader();
       const textDecoder = new TextDecoder();
       let fullBody = "";
+      let firstChunkReceived = false;
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+
+        if (!firstChunkReceived) {
+            cancelTimeout(); // 收到第一个数据块后，取消空闲超时
+            firstChunkReceived = true;
+        }
+
         const chunk = textDecoder.decode(value, { stream: true });
 
         if (requestSpec.streaming_mode === "real") {
