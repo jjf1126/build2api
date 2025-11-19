@@ -189,6 +189,7 @@ class RequestProcessor {
     const queryParams = new URLSearchParams(requestSpec.query_params);
 
     // 新增：检测并处理 "假流式/" 前缀
+    requestSpec.streaming_mode = "real"; 
     if (pathSegment.includes("/假流式/")) {
       // 移除前缀，得到干净的模型路径
       pathSegment = pathSegment.replace("/假流式/", "/");
