@@ -700,24 +700,57 @@ class RequestHandler {
   }
 
   async _switchToNextAuth() {
-    if (this.authSource.availableIndices.length <= 1) {
-      this.logger.warn("[Auth] 😕 检测到只有一个可用账号，拒绝切换操作。");
-      throw new Error("Only one account is available, cannot switch.");
+    const available = this.authSource.availableIndices;
+
+    if (available.length === 0) {
+      throw new Error("没有可用的认证源，无法切换。");
     }
+
     if (this.isAuthSwitching) {
-      this.logger.info("🔄 [Auth] 正在切换账号，跳过重复操作");
+      this.logger.info("🔄 [Auth] 正在切换/重启账号，跳过重复操作");
       return { success: false, reason: "Switch already in progress." };
     }
 
+    // --- 加锁！ ---
     this.isSystemBusy = true;
     this.isAuthSwitching = true;
 
     try {
+      // 单账号模式 - 执行原地重启 (Refresh)
+      if (available.length === 1) {
+        const singleIndex = available[0];
+        this.logger.info("==================================================");
+        this.logger.info(
+          `🔄 [Auth] 单账号模式：达到轮换阈值，正在执行原地重启...`
+        );
+        this.logger.info(`   • 目标账号: #${singleIndex}`);
+        this.logger.info("==================================================");
+
+        try {
+          // 强制重新加载当前账号的 Context
+          await this.browserManager.launchOrSwitchContext(singleIndex);
+
+          // 关键：重置计数器
+          this.failureCount = 0;
+          this.usageCount = 0;
+
+          this.logger.info(
+            `✅ [Auth] 单账号 #${singleIndex} 重启/刷新成功，使用计数已清零。`
+          );
+          return { success: true, newIndex: singleIndex };
+        } catch (error) {
+          this.logger.error(`❌ [Auth] 单账号重启失败: ${error.message}`);
+          throw error;
+        }
+      }
+
+      // 多账号模式 - 执行轮换 (Rotate)
+
       const previousAuthIndex = this.currentAuthIndex;
       const nextAuthIndex = this._getNextAuthIndex();
 
       this.logger.info("==================================================");
-      this.logger.info(`🔄 [Auth] 开始账号切换流程`);
+      this.logger.info(`🔄 [Auth] 多账号模式：开始账号切换流程`);
       this.logger.info(`   • 当前账号: #${previousAuthIndex}`);
       this.logger.info(`   • 目标账号: #${nextAuthIndex}`);
       this.logger.info("==================================================");
@@ -961,6 +994,18 @@ class RequestHandler {
     const requestId = this._generateRequestId();
     const isOpenAIStream = req.body.stream === true;
     const model = req.body.model || "gemini-1.5-pro-latest";
+    const systemStreamMode = this.serverSystem.streamingMode;
+    const useRealStream = isOpenAIStream && systemStreamMode === "real";
+
+    if (this.config.switchOnUses > 0) {
+      this.usageCount++;
+      this.logger.info(
+        `[Request] OpenAI生成请求 - 账号轮换计数: ${this.usageCount}/${this.config.switchOnUses} (当前账号: ${this.currentAuthIndex})`
+      );
+      if (this.usageCount >= this.config.switchOnUses) {
+        this.needsSwitchingAfterRequest = true;
+      }
+    }
 
     let googleBody;
     try {
@@ -974,34 +1019,31 @@ class RequestHandler {
       );
     }
 
-    const googleEndpoint = isOpenAIStream
+    const googleEndpoint = useRealStream
       ? "streamGenerateContent"
       : "generateContent";
     const proxyRequest = {
       path: `/v1beta/models/${model}:${googleEndpoint}`,
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      query_params: isOpenAIStream ? { alt: "sse" } : {},
+      query_params: useRealStream ? { alt: "sse" } : {},
       body: JSON.stringify(googleBody),
       request_id: requestId,
       is_generative: true,
-      streaming_mode: "real",
-      client_wants_stream: true,
+      streaming_mode: useRealStream ? "real" : "fake",
     };
 
     const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
 
     try {
       this._forwardRequest(proxyRequest);
-      const initialMessage = await messageQueue.dequeue(); 
+      const initialMessage = await messageQueue.dequeue();
 
       if (initialMessage.event_type === "error") {
         this.logger.error(
           `[Adapter] 收到来自浏览器的错误，将触发切换逻辑。状态码: ${initialMessage.status}, 消息: ${initialMessage.message}`
         );
-
         await this._handleRequestFailureAndSwitch(initialMessage, res);
-
         if (isOpenAIStream) {
           if (!res.writableEnded) {
             res.write("data: [DONE]\n\n");
@@ -1014,7 +1056,7 @@ class RequestHandler {
             initialMessage.message
           );
         }
-        return; 
+        return;
       }
 
       if (this.failureCount > 0) {
@@ -1031,38 +1073,66 @@ class RequestHandler {
           Connection: "keep-alive",
         });
 
-        let lastGoogleChunk = "";
-        while (true) {
-          const message = await messageQueue.dequeue(300000); 
-          if (message.type === "STREAM_END") {
-            res.write("data: [DONE]\n\n");
-            break;
-          }
-          if (message.data) {
-            const translatedChunk = this._translateGoogleToOpenAIStream(
-              message.data,
-              model
-            );
-            if (translatedChunk) {
-              res.write(translatedChunk);
-            }
-            lastGoogleChunk = message.data; 
-          }
-        }
+        if (useRealStream) {
+          this.logger.info(`[Adapter] OpenAI 流式响应 (Real Mode) 已启动...`);
+          let lastGoogleChunk = "";
+          const streamState = { inThought: false };
 
-        try {
-          if (lastGoogleChunk.startsWith("data: ")) {
-            const jsonString = lastGoogleChunk.substring(6).trim();
-            if (jsonString) {
-              const lastResponse = JSON.parse(jsonString);
-              const finishReason =
-                lastResponse.candidates?.[0]?.finishReason || "UNKNOWN";
-              this.logger.info(
-                `✅ [Request] OpenAI流式响应结束，原因: ${finishReason}，请求ID: ${requestId}`
+          while (true) {
+            const message = await messageQueue.dequeue(300000); // 5分钟超时
+            if (message.type === "STREAM_END") {
+              if (streamState.inThought) {
+                const closeThoughtPayload = {
+                  id: `chatcmpl-${requestId}`,
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: model,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: { content: "\n</think>\n" },
+                      finish_reason: null,
+                    },
+                  ],
+                };
+                res.write(`data: ${JSON.stringify(closeThoughtPayload)}\n\n`);
+              }
+              res.write("data: [DONE]\n\n");
+              break;
+            }
+            if (message.data) {
+              const translatedChunk = this._translateGoogleToOpenAIStream(
+                message.data,
+                model,
+                streamState
               );
+              if (translatedChunk) {
+                res.write(translatedChunk);
+              }
+              lastGoogleChunk = message.data;
             }
           }
-        } catch (e) {
+        } else {
+          this.logger.info(`[Adapter] OpenAI 流式响应 (Fake Mode) 已启动...`);
+
+          let fullBody = "";
+          while (true) {
+            const message = await messageQueue.dequeue(300000);
+            if (message.type === "STREAM_END") break;
+            if (message.data) fullBody += message.data;
+          }
+
+          const translatedChunk = this._translateGoogleToOpenAIStream(
+            fullBody,
+            model
+          );
+          if (translatedChunk) {
+            res.write(translatedChunk);
+          }
+          res.write("data: [DONE]\n\n");
+          this.logger.info(
+            `[Adapter] Fake模式：已一次性发送完整内容并结束流。`
+          );
         }
       } else {
         let fullBody = "";
@@ -1093,8 +1163,25 @@ class RequestHandler {
               "[Adapter] 从 parts.inlineData 中成功解析到图片。"
             );
           } else {
-            responseContent =
-              candidate.content.parts.map((p) => p.text).join("\n") || "";
+            let mainContent = "";
+            let reasoningContent = "";
+
+            candidate.content.parts.forEach((p) => {
+              if (p.thought) {
+                reasoningContent += p.text;
+              } else {
+                mainContent += p.text;
+              }
+            });
+
+            responseContent = mainContent;
+            var messageObj = {
+              role: "assistant",
+              content: responseContent,
+            };
+            if (reasoningContent) {
+              messageObj.reasoning_content = reasoningContent;
+            }
           }
         }
 
@@ -1106,8 +1193,8 @@ class RequestHandler {
           choices: [
             {
               index: 0,
-              message: { role: "assistant", content: responseContent },
-              finish_reason: candidate?.finishReason || "UNKNOWN",
+              message: messageObj || { role: "assistant", content: "" },
+              finish_reason: candidate?.finishReason,
             },
           ],
         };
@@ -1123,88 +1210,91 @@ class RequestHandler {
       this._handleRequestError(error, res);
     } finally {
       this.connectionRegistry.removeMessageQueue(requestId);
+      if (this.needsSwitchingAfterRequest) {
+        this.logger.info(
+          `[Auth] OpenAI轮换计数已达到切换阈值 (${this.usageCount}/${this.config.switchOnUses})，将在后台自动切换账号...`
+        );
+        this._switchToNextAuth().catch((err) => {
+          this.logger.error(`[Auth] 后台账号切换任务失败: ${err.message}`);
+        });
+        this.needsSwitchingAfterRequest = false;
+      }
       if (!res.writableEnded) {
         res.end();
       }
     }
   }
 
-// [修改] 动态获取模型列表：设定适中的 pageSize 以覆盖所有活跃模型
-async processModelListRequest(req, res) {
-  const requestId = this._generateRequestId();
-  
-  const proxyRequest = this._buildProxyRequest(req, requestId);
-
-  // 1. 强制指向 v1beta (通常模型最全)
-  proxyRequest.path = "/v1beta/models";
-  proxyRequest.method = "GET";
-  proxyRequest.body = null;
-  proxyRequest.is_generative = false;
-  proxyRequest.streaming_mode = "fake";
-  proxyRequest.client_wants_stream = false;
-  
-  // 2. [关键修正] 设置一个“适中”的 pageSize。
-  // - 不传(默认): 可能只有 32 个 (你的现状)
-  // - 传 1000: 会拉到大量历史废弃模型 (你之前觉得太多)
-  // - 传 100: 足以覆盖当前的 ~37 个活跃模型，又不会拉取太古老的版本
-  proxyRequest.query_params = { ...req.query, pageSize: 100 };
-
-  this.logger.info(`[Adapter] 收到获取模型列表请求，正在转发至Google (pageSize=100)... (Request ID: ${requestId})`);
-  
-  const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
-
-  try {
-    this._forwardRequest(proxyRequest);
+  async processModelListRequest(req, res) {
+    const requestId = this._generateRequestId();
     
-    const headerMessage = await messageQueue.dequeue();
-    if (headerMessage.event_type === "error") {
-      throw new Error(headerMessage.message || "Upstream error");
-    }
+    const proxyRequest = this._buildProxyRequest(req, requestId);
 
-    let fullBody = "";
-    while (true) {
-      const message = await messageQueue.dequeue(60000);
-      if (message.type === "STREAM_END") break;
-      if (message.event_type === "chunk" && message.data) {
-        fullBody += message.data;
-      }
-    }
+    proxyRequest.path = "/v1beta/models";
+    proxyRequest.method = "GET";
+    proxyRequest.body = null;
+    proxyRequest.is_generative = false;
+    proxyRequest.streaming_mode = "fake";
+    proxyRequest.client_wants_stream = false;
+    
+    proxyRequest.query_params = { ...req.query, pageSize: 100 };
 
-    let googleModels = [];
+    this.logger.info(`[Adapter] 收到获取模型列表请求，正在转发至Google (pageSize=100)... (Request ID: ${requestId})`);
+    
+    const messageQueue = this.connectionRegistry.createMessageQueue(requestId);
+
     try {
-      const googleResponse = JSON.parse(fullBody);
-      googleModels = googleResponse.models || [];
-    } catch (e) {
-      this.logger.warn(`[Adapter] 解析模型列表JSON失败: ${e.message}`);
+      this._forwardRequest(proxyRequest);
+      
+      const headerMessage = await messageQueue.dequeue();
+      if (headerMessage.event_type === "error") {
+        throw new Error(headerMessage.message || "Upstream error");
+      }
+
+      let fullBody = "";
+      while (true) {
+        const message = await messageQueue.dequeue(60000);
+        if (message.type === "STREAM_END") break;
+        if (message.event_type === "chunk" && message.data) {
+          fullBody += message.data;
+        }
+      }
+
+      let googleModels = [];
+      try {
+        const googleResponse = JSON.parse(fullBody);
+        googleModels = googleResponse.models || [];
+      } catch (e) {
+        this.logger.warn(`[Adapter] 解析模型列表JSON失败: ${e.message}`);
+      }
+      
+      const openaiModels = googleModels.map(model => {
+        const id = model.name.replace("models/", "");
+        return {
+          id: id,
+          object: "model",
+          created: Math.floor(Date.now() / 1000),
+          owned_by: "google",
+          permission: [],
+          root: id,
+          parent: null
+        };
+      });
+
+      res.status(200).json({
+        object: "list",
+        data: openaiModels
+      });
+      
+      this.logger.info(`[Adapter] 成功获取并返回了 ${openaiModels.length} 个模型。`);
+
+    } catch (error) {
+      this.logger.error(`[Adapter] 获取模型列表失败: ${error.message}`);
+      this._sendErrorResponse(res, 500, "Failed to fetch model list.");
+    } finally {
+      this.connectionRegistry.removeMessageQueue(requestId);
     }
-    
-    const openaiModels = googleModels.map(model => {
-      const id = model.name.replace("models/", "");
-      return {
-        id: id,
-        object: "model",
-        created: Math.floor(Date.now() / 1000),
-        owned_by: "google",
-        permission: [],
-        root: id,
-        parent: null
-      };
-    });
-
-    res.status(200).json({
-      object: "list",
-      data: openaiModels
-    });
-    
-    this.logger.info(`[Adapter] 成功获取并返回了 ${openaiModels.length} 个模型。`);
-
-  } catch (error) {
-    this.logger.error(`[Adapter] 获取模型列表失败: ${error.message}`);
-    this._sendErrorResponse(res, 500, "Failed to fetch model list.");
-  } finally {
-    this.connectionRegistry.removeMessageQueue(requestId);
   }
-}
 
   _cancelBrowserRequest(requestId) {
     const connection = this.connectionRegistry.getFirstConnection();
@@ -1228,11 +1318,36 @@ async processModelListRequest(req, res) {
   _generateRequestId() {
     return `${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
   }
+
   _buildProxyRequest(req, requestId) {
-    let requestBody = "";
-    if (req.body) {
-      requestBody = JSON.stringify(req.body);
+    let bodyObj = req.body;
+    if (
+      this.serverSystem.forceThinking &&
+      req.method === "POST" &&
+      bodyObj &&
+      bodyObj.contents
+    ) {
+      if (!bodyObj.generationConfig) {
+        bodyObj.generationConfig = {};
+      }
+
+      if (!bodyObj.generationConfig.thinkingConfig) {
+        this.logger.info(
+          `[Proxy] ⚠️ (Google原生格式) 强制推理已启用，且客户端未提供配置，正在注入 thinkingConfig...`
+        );
+        bodyObj.generationConfig.thinkingConfig = { includeThoughts: true };
+      } else {
+        this.logger.info(
+          `[Proxy] ✅ (Google原生格式) 检测到客户端自带推理配置，跳过强制注入。`
+        );
+      }
     }
+
+    let requestBody = "";
+    if (bodyObj) {
+      requestBody = JSON.stringify(bodyObj);
+    }
+
     return {
       path: req.path,
       method: req.method,
@@ -1243,6 +1358,7 @@ async processModelListRequest(req, res) {
       streaming_mode: this.serverSystem.streamingMode,
     };
   }
+
   _forwardRequest(proxyRequest) {
     const connection = this.connectionRegistry.getFirstConnection();
     if (connection) {
@@ -1428,7 +1544,6 @@ async processModelListRequest(req, res) {
       this.failureCount = 0;
     }
 
-    // [核心修正] 传入 true 标志，强制使用 text/event-stream
     this._setResponseHeaders(res, headerMessage, true); 
     
     this.logger.info("[Request] 开始流式传输...");
@@ -1598,13 +1713,11 @@ async processModelListRequest(req, res) {
     return "data: {}\n\n";
   }
 
-  // [核心修正] 强制覆盖ContentType
   _setResponseHeaders(res, headerMessage, isStream = false) {
     res.status(headerMessage.status || 200);
     const headers = headerMessage.headers || {};
     Object.entries(headers).forEach(([name, value]) => {
       if (name.toLowerCase() === "content-length") return;
-      // 如果是流式传输，强制忽略上游返回的 content-type (通常报错时会是text/plain)
       if (isStream && name.toLowerCase() === "content-type") return;
       res.set(name, value);
     });
@@ -1651,30 +1764,38 @@ async processModelListRequest(req, res) {
     let systemInstruction = null;
     const googleContents = [];
 
+    // 1. 分离出 system 指令
     const systemMessages = openaiBody.messages.filter(
       (msg) => msg.role === "system"
     );
     if (systemMessages.length > 0) {
+      // 将所有 system message 的内容合并
       const systemContent = systemMessages.map((msg) => msg.content).join("\n");
       systemInstruction = {
+        // Google Gemini 1.5 Pro 开始正式支持 system instruction
         role: "system",
         parts: [{ text: systemContent }],
       };
     }
 
+    // 2. 转换 user 和 assistant 消息
     const conversationMessages = openaiBody.messages.filter(
       (msg) => msg.role !== "system"
     );
     for (const message of conversationMessages) {
       const googleParts = [];
 
+      // [核心改进] 判断 content 是字符串还是数组
       if (typeof message.content === "string") {
+        // a. 如果是纯文本
         googleParts.push({ text: message.content });
       } else if (Array.isArray(message.content)) {
+        // b. 如果是图文混合内容
         for (const part of message.content) {
           if (part.type === "text") {
             googleParts.push({ text: part.text });
           } else if (part.type === "image_url" && part.image_url) {
+            // 从 data URL 中提取 mimetype 和 base64 数据
             const dataUrl = part.image_url.url;
             const match = dataUrl.match(/^data:(image\/.*?);base64,(.*)$/);
             if (match) {
@@ -1695,6 +1816,7 @@ async processModelListRequest(req, res) {
       });
     }
 
+    // 3. 构建最终的Google请求体
     const googleRequest = {
       contents: googleContents,
       ...(systemInstruction && {
@@ -1702,6 +1824,7 @@ async processModelListRequest(req, res) {
       }),
     };
 
+    // 4. 转换生成参数
     const generationConfig = {
       temperature: openaiBody.temperature,
       topP: openaiBody.top_p,
@@ -1709,8 +1832,61 @@ async processModelListRequest(req, res) {
       maxOutputTokens: openaiBody.max_tokens,
       stopSequences: openaiBody.stop,
     };
+
+    const extraBody = openaiBody.extra_body || {};
+    let rawThinkingConfig =
+      extraBody.google?.thinking_config ||
+      extraBody.google?.thinkingConfig ||
+      extraBody.thinkingConfig ||
+      extraBody.thinking_config ||
+      openaiBody.thinkingConfig ||
+      openaiBody.thinking_config;
+
+    let thinkingConfig = null;
+
+    if (rawThinkingConfig) {
+      // 2. 格式清洗：将 snake_case (下划线) 转换为 camelCase (驼峰)
+      thinkingConfig = {};
+
+      // 处理开关
+      if (rawThinkingConfig.include_thoughts !== undefined) {
+        thinkingConfig.includeThoughts = rawThinkingConfig.include_thoughts;
+      } else if (rawThinkingConfig.includeThoughts !== undefined) {
+        thinkingConfig.includeThoughts = rawThinkingConfig.includeThoughts;
+      }
+
+      this.logger.info(
+        `[Adapter] 成功提取并转换推理配置: ${JSON.stringify(thinkingConfig)}`
+      );
+    }
+
+    // 3. 如果没找到配置，尝试识别 OpenAI 标准参数 'reasoning_effort'
+    if (!thinkingConfig) {
+      const effort = openaiBody.reasoning_effort || extraBody.reasoning_effort;
+      if (effort) {
+        this.logger.info(
+          `[Adapter] 检测到 OpenAI 标准推理参数 (reasoning_effort: ${effort})，自动转换为 Google 格式。`
+        );
+        thinkingConfig = { includeThoughts: true };
+      }
+    }
+
+    // 4. 强制开启逻辑 (WebUI开关)
+    if (this.serverSystem.forceThinking && !thinkingConfig) {
+      this.logger.info(
+        "[Adapter] ⚠️ 强制推理已启用，且客户端未提供配置，正在注入 thinkingConfig..."
+      );
+      thinkingConfig = { includeThoughts: true };
+    }
+
+    // 5. 写入最终配置
+    if (thinkingConfig) {
+      generationConfig.thinkingConfig = thinkingConfig;
+    }
+
     googleRequest.generationConfig = generationConfig;
 
+    // 5. 安全设置
     googleRequest.safetySettings = [
       { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
       { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
@@ -1764,19 +1940,43 @@ async processModelListRequest(req, res) {
       return null;
     }
 
-    let content = "";
+    const delta = {};
+
     if (candidate.content && Array.isArray(candidate.content.parts)) {
       const imagePart = candidate.content.parts.find((p) => p.inlineData);
+
       if (imagePart) {
         const image = imagePart.inlineData;
-        content = `![Generated Image](data:${image.mimeType};base64,${image.data})`;
+        delta.content = `![Generated Image](data:${image.mimeType};base64,${image.data})`;
         this.logger.info("[Adapter] 从流式响应块中成功解析到图片。");
       } else {
-        content = candidate.content.parts.map((p) => p.text).join("") || "";
+        // 遍历所有部分，分离思考内容和正文内容
+        let contentAccumulator = "";
+        let reasoningAccumulator = "";
+
+        for (const part of candidate.content.parts) {
+          // Google API 的 thought 标记
+          if (part.thought === true) {
+            reasoningAccumulator += part.text || "";
+          } else {
+            contentAccumulator += part.text || "";
+          }
+        }
+
+        // 只有当有内容时才添加到 delta 中
+        if (reasoningAccumulator) {
+          delta.reasoning_content = reasoningAccumulator;
+        }
+        if (contentAccumulator) {
+          delta.content = contentAccumulator;
+        }
       }
     }
 
-    const finishReason = candidate.finishReason;
+    // 如果没有任何内容变更，则不返回数据（避免空行）
+    if (!delta.content && !delta.reasoning_content && !candidate.finishReason) {
+      return null;
+    }
 
     const openaiResponse = {
       id: `chatcmpl-${this._generateRequestId()}`,
@@ -1786,8 +1986,8 @@ async processModelListRequest(req, res) {
       choices: [
         {
           index: 0,
-          delta: { content: content },
-          finish_reason: finishReason || null,
+          delta: delta, // 使用包含 reasoning_content 的 delta
+          finish_reason: candidate.finishReason || null,
         },
       ],
     };
@@ -1802,6 +2002,7 @@ class ProxyServerSystem extends EventEmitter {
     this.logger = new LoggingService("ProxySystem");
     this._loadConfiguration(); 
     this.streamingMode = this.config.streamingMode;
+    this.forceThinking = false;
 
     this.authSource = new AuthSource(this.logger);
     this.browserManager = new BrowserManager(
@@ -1913,7 +2114,6 @@ class ProxyServerSystem extends EventEmitter {
       this.logger.info("[System] 未设置任何API Key，已启用默认密码: 123456");
     }
     
-    // [修改] 移除读取 models.json 的逻辑
     this.config = config;
     this.logger.info("================ [ 生效配置 ] ================");
     this.logger.info(`  HTTP 服务端口: ${this.config.httpPort}`);
@@ -2005,8 +2205,6 @@ class ProxyServerSystem extends EventEmitter {
   }
 
   _createAuthMiddleware() {
-    const basicAuth = require("basic-auth"); 
-
     return (req, res, next) => {
       const serverApiKeys = this.config.apiKeys;
       if (!serverApiKeys || serverApiKeys.length === 0) {
@@ -2150,9 +2348,6 @@ class ProxyServerSystem extends EventEmitter {
       }
     });
 
-    // ==========================================================
-    // Section 3: 状态页面 (修复版：确保 prompt 不换行)
-    // ==========================================================
     app.get("/", isAuthenticated, (req, res) => {
       const { config, requestHandler, authSource, browserManager } = this;
       const initialIndices = authSource.initialIndices || [];
@@ -2177,7 +2372,6 @@ class ProxyServerSystem extends EventEmitter {
         .map((index) => `<option value="${index}">账号 #${index}</option>`)
         .join("");
 
-      // [注意] 下面的 HTML 字符串中，script 标签里的 prompt 行已修复为单行
       const statusHtml = `
     <!DOCTYPE html>
     <html lang="zh-CN">
@@ -2221,9 +2415,8 @@ class ProxyServerSystem extends EventEmitter {
         browserManager.browser ? "status-ok" : "status-error"
       }">${!!browserManager.browser}</span>
 --- 服务配置 ---
-<span class="label">流模式</span>: ${
-        config.streamingMode
-      } (仅启用流式传输时生效)
+<span class="label">流模式</span>: ${this.streamingMode}
+<span class="label">强制推理</span>: ${this.forceThinking ? "开启" : "关闭"}
 <span class="label">立即切换 (状态码)</span>: ${
         config.immediateSwitchStatusCodes.length > 0
           ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
@@ -2257,6 +2450,7 @@ class ProxyServerSystem extends EventEmitter {
                 <select id="accountIndexSelect">${accountOptionsHtml}</select>
                 <button onclick="switchSpecificAccount()">切换账号</button>
                 <button onclick="toggleStreamingMode()">切换流模式</button>
+                <button onclick="toggleThinkingMode()">切换强制推理</button>
             </div>
         </div>
         </div>
@@ -2272,6 +2466,7 @@ class ProxyServerSystem extends EventEmitter {
                     '<span class="label">浏览器连接</span>: <span class="' + (data.status.browserConnected ? "status-ok" : "status-error") + '">' + data.status.browserConnected + '</span>\\n' +
                     '--- 服务配置 ---\\n' +
                     '<span class="label">流模式</span>: ' + data.status.streamingMode + '\\n' +
+                    '<span class="label">强制推理</span>: ' + data.status.forceThinking + '\\n' +
                     '<span class="label">立即切换 (状态码)</span>: ' + data.status.immediateSwitchStatusCodes + '\\n' +
                     '<span class="label">API 密钥</span>: ' + data.status.apiKeySource + '\\n' +
                     '--- 账号状态 ---\\n' +
@@ -2313,7 +2508,6 @@ class ProxyServerSystem extends EventEmitter {
             });
         }
 
-        // [这里是关键修复] 确保这一行在一行内，不要有物理换行
         function toggleStreamingMode() { 
             const newMode = prompt('请输入新的流模式 (real 或 fake):', '${this.config.streamingMode}');
             if (newMode === 'fake' || newMode === 'real') {
@@ -2327,6 +2521,12 @@ class ProxyServerSystem extends EventEmitter {
             } else if (newMode !== null) { 
                 alert('无效的模式！请只输入 "real" 或 "fake"。'); 
             } 
+        }
+
+        function toggleThinkingMode() {
+            fetch('/api/toggle-thinking', { method: 'POST' })
+            .then(res => res.text()).then(data => { alert(data); updateContent(); })
+            .catch(err => alert('设置失败: ' + err));
         }
 
         document.addEventListener('DOMContentLoaded', () => {
@@ -2358,7 +2558,8 @@ class ProxyServerSystem extends EventEmitter {
 
       const data = {
         status: {
-          streamingMode: `${this.streamingMode} (仅启用流式传输时生效)`,
+          streamingMode: this.streamingMode,
+          forceThinking: this.forceThinking ? "开启" : "关闭",
           browserConnected: !!browserManager.browser,
           immediateSwitchStatusCodes:
             config.immediateSwitchStatusCodes.length > 0
@@ -2402,11 +2603,6 @@ class ProxyServerSystem extends EventEmitter {
           }
         } else {
           this.logger.info("[WebUI] 收到手动切换下一个账号的请求...");
-          if (this.authSource.availableIndices.length <= 1) {
-            return res
-              .status(400)
-              .send("切换操作已取消：只有一个可用账号，无法切换。");
-          }
           const result = await this.requestHandler._switchToNextAuth();
           if (result.success) {
             res
@@ -2430,6 +2626,7 @@ class ProxyServerSystem extends EventEmitter {
       const newMode = req.body.mode;
       if (newMode === "fake" || newMode === "real") {
         this.streamingMode = newMode;
+        this.requestHandler.serverSystem.streamingMode = newMode;
         this.logger.info(
           `[WebUI] 流式模式已由认证用户切换为: ${this.streamingMode}`
         );
@@ -2437,6 +2634,13 @@ class ProxyServerSystem extends EventEmitter {
       } else {
         res.status(400).send('无效模式. 请用 "fake" 或 "real".');
       }
+    });
+    app.post("/api/toggle-thinking", isAuthenticated, (req, res) => {
+        this.forceThinking = !this.forceThinking;
+        this.requestHandler.serverSystem.forceThinking = this.forceThinking;
+        const status = this.forceThinking ? "开启" : "关闭";
+        this.logger.info(`[WebUI] 强制推理模式已由认证用户切换为: ${status}`);
+        res.status(200).send(`强制推理模式已: ${status}`);
     });
     app.use(this._createAuthMiddleware());
 
