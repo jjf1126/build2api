@@ -409,94 +409,29 @@ class ProxySystem extends EventTarget {
 
       const reader = response.body.getReader();
       const textDecoder = new TextDecoder();
-      let buffer = "";
-      let isThinking = false;
+      let fullBody = "";
       let firstChunkReceived = false;
 
-      // 如果是假流式，则完全恢复到原始的、最稳定的处理方式
-      if (requestSpec.streaming_mode !== "real") {
-          let fullBody = "";
-          while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              if (!firstChunkReceived) {
-                  cancelTimeout();
-                  firstChunkReceived = true;
-              }
-              fullBody += textDecoder.decode(value);
-          }
-          this._transmitChunk(fullBody, operationId);
-          this._transmitStreamEnd(operationId);
-          return; // 提前结束
-      }
-
-      // --- 以下是针对真流式(real streaming)的全新健壮处理逻辑 ---
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         if (!firstChunkReceived) {
-            cancelTimeout();
+            cancelTimeout(); // 收到第一个数据块后，取消空闲超时
             firstChunkReceived = true;
         }
 
-        buffer += textDecoder.decode(value, { stream: true });
-        
-        // 逐行处理缓冲区中的数据
-        let newlineIndex;
-        while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
-            const line = buffer.substring(0, newlineIndex).trim();
-            buffer = buffer.substring(newlineIndex + 1);
+        const chunk = textDecoder.decode(value, { stream: true });
 
-            if (line.length === 0 || !line.startsWith('data:')) continue;
-
-            let jsonStr = line.substring(5).trim(); // 移除 'data: ' 前缀
-            
-            // 移除Google流中可能存在的多余的起始逗号
-            if (jsonStr.startsWith(',')) {
-                jsonStr = jsonStr.substring(1);
-            }
-
-            try {
-                const data = JSON.parse(jsonStr);
-                // 使用可选链安全地访问嵌套属性，防止因数据结构不完整而崩溃
-                const parts = data.candidates?.[0]?.content?.parts;
-
-                if (Array.isArray(parts)) {
-                    for (const part of parts) {
-                        const thoughtText = part.thought;
-                        const regularText = part.text;
-
-                        // 检查是否存在思考内容 (thought 字段是字符串)
-                        if (thoughtText && typeof thoughtText === 'string') {
-                            if (!isThinking) {
-                                this._transmitChunk("\n
-\n", operationId);
-                                isThinking = true;
-                            }
-                            this._transmitChunk(thoughtText, operationId);
-                        } 
-                        // 检查是否存在正文内容
-                        else if (regularText) {
-                            if (isThinking) {
-                                // 如果之前在思考，现在收到了正文，就结束思考状态
-                                this._transmitChunk("\n</think>\n", operationId);
-                                isThinking = false;
-                            }
-                            this._transmitChunk(regularText, operationId);
-                        }
-                    }
-                }
-            } catch (e) {
-                // 如果某一行不是有效的JSON，这很正常，可能是流的元数据或空行
-                // 我们选择静默忽略它，而不是让整个脚本崩溃，这是稳定性的关键
-                // Logger.output("Skipping non-JSON line:", line);
-            }
+        if (requestSpec.streaming_mode === "real") {
+          this._transmitChunk(chunk, operationId);
+        } else {
+          fullBody += chunk;
         }
       }
 
-      // 确保在数据流的最后关闭 
-\n", operationId);
+      if (requestSpec.streaming_mode !== "real") {
+        this._transmitChunk(fullBody, operationId);
       }
 
       this._transmitStreamEnd(operationId);
@@ -515,7 +450,9 @@ class ProxySystem extends EventTarget {
 
   _transmitHeaders(response, operationId) {
     const headerMap = {};
-    response.headers.forEach((v, k) => { headerMap[k] = v; });
+    response.headers.forEach((v, k) => {
+      headerMap[k] = v;
+    });
     this.connectionManager.transmit({
       request_id: operationId,
       event_type: "response_headers",
