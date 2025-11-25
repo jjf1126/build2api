@@ -252,7 +252,7 @@ class RequestProcessor {
         let bodyObj = JSON.parse(requestSpec.body);
         const path = requestSpec.path;
         // --- 模块0：加入 "-search"等模式 ---
-        if (requestSpec.path.includes("-search:")) {
+        if (requestSpec.path.includes("-search")) {
           if (!bodyObj.tools) {
             bodyObj.tools = [{
               "google_search": {} // 使用新的工具名称
@@ -272,13 +272,13 @@ class RequestProcessor {
           
           // 仅当用户没有在原始请求中提供 thinkingConfig 时，才应用后缀逻辑
           if (!bodyObj.generationConfig.thinkingConfig) {
-            if (requestSpec.path.includes("-high:")) {
+            if (requestSpec.path.includes("-high")) {
               bodyObj.generationConfig.thinkingConfig = {
                 includeThoughts: true,
                 thinkingBudgetTokenLimit: 8192 // 高推理预算
               };
               Logger.output("✅ 检测到 '-high' 后缀，已应用高级推理配置。");
-            } else if (requestSpec.path.includes("-low:")) {
+            } else if (requestSpec.path.includes("-low")) {
               bodyObj.generationConfig.thinkingConfig = {
                 includeThoughts: true,
                 thinkingBudgetTokenLimit: 512 // 低推理预算
