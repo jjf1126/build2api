@@ -207,9 +207,7 @@ class RequestProcessor {
     if (actionPart !== undefined) { // 确保路径中包含 ":"
       const originalModelPart = modelPart;
       const cleanedModelPart = originalModelPart
-        .replace("-search", "")
-        .replace("-high", "")
-        .replace("-low", "");
+        .replace("-search", "");
 
       if (originalModelPart !== cleanedModelPart) {
         pathSegment = `${cleanedModelPart}:${actionPart}`;
@@ -258,39 +256,6 @@ class RequestProcessor {
               "google_search": {} // 使用新的工具名称
             }];
             Logger.output("✅ 检测到 '-search' 后缀，已为请求开启联网模式。");
-          }
-        }
-
-
-        // --- 新增模块：gemini-3-pro-preview 的高级功能 ---
-        const isGemini3Preview = requestSpec.path.includes("gemini-3-pro-preview");
-        if (isGemini3Preview) {
-          // 1. 默认开启 URL Context 功能 (如果用户未提供)
-          if (!bodyObj.context) {
-            bodyObj.context = { urls: [] };
-            Logger.output("✅ Gemini 3 Preview: 已默认开启 URL context 功能。");
-          }
-
-          // 2. 处理 -high/-low 推理等级后缀
-          if (!bodyObj.generationConfig) {
-            bodyObj.generationConfig = {};
-          }
-          if (!bodyObj.generationConfig.thinkingConfig) {
-            if (requestSpec.path.includes("-high")) {
-              bodyObj.generationConfig.thinkingConfig = {
-                includeThoughts: true,
-                thinkingLevel: 'high' // 直接设置推理等级
-              };
-              Logger.output("✅ 检测到 '-high' 后缀，已设置推理等级为 'high'。");
-            } else if (requestSpec.path.includes("-low")) {
-              bodyObj.generationConfig.thinkingConfig = {
-                includeThoughts: true,
-                thinkingLevel: 'low' // 直接设置推理等级
-              };
-              Logger.output("✅ 检测到 '-low' 后缀，已设置推理等级为 'low'。");
-            }
-          } else {
-            Logger.output("ℹ️ 检测到用户自定义的 thinkingConfig，将忽略 -high/-low 后缀。");
           }
         }
 
