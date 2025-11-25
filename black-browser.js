@@ -259,14 +259,32 @@ class RequestProcessor {
           }
         }
 
-        
+
+        // --- 模块1：开启思考链 (Thinking) ---
+        // 自动为支持的模型开启思考功能
+        const isThinkingModel = 
+            path.includes("gemini-2.0-flash-thinking") || 
+            path.includes("gemini-2.5") || 
+            path.includes("gemini-3");
+
+        if (isThinkingModel) {
+            if (!bodyObj.generationConfig) {
+                bodyObj.generationConfig = {};
+            }
+            // 注入 thinkingConfig
+            bodyObj.generationConfig.thinkingConfig = {
+                includeThoughts: true 
+            };
+            Logger.output("🧠 已为请求开启思考链模式 (Thinking Mode)");
+        }
+
         // --- 模块1：智能过滤 ---
         const isImageModel =
           requestSpec.path.includes("-image-") ||
           requestSpec.path.includes("imagen");
-
+            
         if (isImageModel) {
-          const incompatibleKeys = ["tool_config", "toolChoice", "tools"];
+          const incompatibleKeys = ["tool_config", "toolChoice", "tools", "thinkingConfig"];
           incompatibleKeys.forEach((key) => {
             if (bodyObj.hasOwnProperty(key)) delete bodyObj[key];
           });
