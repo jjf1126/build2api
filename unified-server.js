@@ -1113,6 +1113,7 @@ class RequestHandler {
         this.needsSwitchingAfterRequest = false;
       }
     }
+  } 
 
   async processOpenAIRequest(req, res) {
     const requestId = this._generateRequestId();
@@ -1372,7 +1373,8 @@ class RequestHandler {
         res.end();
       }
     }
-
+  } 
+  
   async processModelListRequest(req, res) {
     const requestId = this._generateRequestId();
     
