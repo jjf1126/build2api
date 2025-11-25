@@ -258,15 +258,6 @@ class RequestProcessor {
             }];
             Logger.output("✅ 检测到 '-search' 后缀，已为请求开启联网模式。");
           }
-          // 这是获取工具使用思考过程的【正确】方式
-          if (!bodyObj.tool_config) {
-            bodyObj.tool_config = {
-              "tool_calling_config": {
-                "mode": "ANY" // "ANY" 强制模型考虑使用工具，这会触发思考过程的输出
-              }
-            };
-            Logger.output("🛠️ 已为联网模式配置 tool_config 以获取思考过程。");
-          }
         }
 
         // --- 模块1：智能过滤 ---
@@ -376,74 +367,86 @@ class ProxySystem extends EventTarget {
     }
   }
 
+
   async _processProxyRequest(requestSpec) {
     const operationId = requestSpec.request_id;
-    
     try {
-      if (this.requestProcessor.cancelledOperations.has(operationId)) {
-        throw new DOMException("The user aborted a request.", "AbortError");
-      }
-      
-      const { responsePromise, cancelTimeout } = this.requestProcessor.execute(requestSpec, operationId);
-      const response = await responsePromise;
-      
-      if (this.requestProcessor.cancelledOperations.has(operationId)) {
-        throw new DOMException("The user aborted a request.", "AbortError");
-      }
-
-      this._transmitHeaders(response, operationId);
-      
-      if (!response.body) {
-          this._transmitStreamEnd(operationId);
-          return;
-      }
-
-      const reader = response.body.getReader();
-      const textDecoder = new TextDecoder();
-      let fullBody = "";
-      let firstChunkReceived = false;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        if (!firstChunkReceived) {
-            cancelTimeout(); // 收到第一个数据块后，取消空闲超时
-            firstChunkReceived = true;
+        const { responsePromise, cancelTimeout } = this.requestProcessor.execute(requestSpec, operationId);
+        const response = await responsePromise;
+        this._transmitHeaders(response, operationId);
+        if (!response.body) {
+            this._transmitStreamEnd(operationId);
+            return;
         }
+        const reader = response.body.getReader();
+        const textDecoder = new TextDecoder();
+        let buffer = "";
+        let isThinking = false;
+        let firstChunkReceived = false;
 
-        const chunk = textDecoder.decode(value, { stream: true });
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!firstChunkReceived) {
+                cancelTimeout();
+                firstChunkReceived = true;
+            }
+            buffer += textDecoder.decode(value, { stream: true });
+            let newlineIndex;
+            while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+                const line = buffer.substring(0, newlineIndex).trim();
+                buffer = buffer.substring(newlineIndex + 1);
+                if (line.length === 0 || !line.startsWith('data:')) continue;
+                let jsonStr = line.substring(5).trim();
+                if (jsonStr.startsWith(',')) jsonStr = jsonStr.substring(1);
+                try {
+                    const data = JSON.parse(jsonStr);
+                    const toolCallParts = data.candidates?.[0]?.content?.parts?.filter(p => p.functionCall);
+                    const textParts = data.candidates?.[0]?.content?.parts?.filter(p => p.text);
 
-        if (requestSpec.streaming_mode === "real") {
-          this._transmitChunk(chunk, operationId);
-        } else {
-          fullBody += chunk;
+                    // Gemini 1.5 Pro 的思考过程在 functionCall.thought 中
+                    if (toolCallParts && toolCallParts.length > 0) {
+                        for (const part of toolCallParts) {
+                            const thoughtText = part.functionCall.thought;
+                            if (thoughtText && typeof thoughtText === 'string') {
+                                if (!isThinking) {
+                                    this._transmitChunk("\n```thought\n", operationId);
+                                    isThinking = true;
+                                }
+                                this._transmitChunk(thoughtText, operationId);
+                            }
+                        }
+                    }
+                    
+                    if (textParts && textParts.length > 0) {
+                         for (const part of textParts) {
+                            const regularText = part.text;
+                            if (regularText) {
+                                if (isThinking) {
+                                    this._transmitChunk("\n```\n\n", operationId);
+                                    isThinking = false;
+                                }
+                                this._transmitChunk(regularText, operationId);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // 安全地忽略任何无法解析的行
+                }
+            }
         }
-      }
-
-      if (requestSpec.streaming_mode !== "real") {
-        this._transmitChunk(fullBody, operationId);
-      }
-
-      this._transmitStreamEnd(operationId);
+        if (isThinking) {
+            this._transmitChunk("\n```\n\n", operationId);
+        }
+        this._transmitStreamEnd(operationId);
     } catch (error) {
-      if (error.name === "AbortError") {
-        Logger.output(`[诊断] 操作 #${operationId} 已被用户中止。`);
-      } else {
-        Logger.output(`❌ 请求处理失败: ${error.message}`);
-      }
-      this._sendErrorResponse(error, operationId);
-    } finally {
-      this.requestProcessor.activeOperations.delete(operationId);
-      this.requestProcessor.cancelledOperations.delete(operationId);
+        this._sendErrorResponse(error, operationId);
     }
   }
 
   _transmitHeaders(response, operationId) {
     const headerMap = {};
-    response.headers.forEach((v, k) => {
-      headerMap[k] = v;
-    });
+    response.headers.forEach((v, k) => { headerMap[k] = v; });
     this.connectionManager.transmit({
       request_id: operationId,
       event_type: "response_headers",
@@ -466,7 +469,6 @@ class ProxySystem extends EventTarget {
       request_id: operationId,
       event_type: "stream_close",
     });
-    Logger.output("任务完成，已发送流结束信号");
   }
 
   _sendErrorResponse(error, operationId) {
@@ -477,11 +479,6 @@ class ProxySystem extends EventTarget {
       status: error.status || 504,
       message: `代理端浏览器错误: ${error.message || "未知错误"}`,
     });
-    if (error.name === "AbortError") {
-      Logger.output("已将“中止”状态发送回服务器");
-    } else {
-      Logger.output("已将“错误”信息发送回服务器");
-    }
   }
 }
 
