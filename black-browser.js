@@ -422,7 +422,7 @@ class ProxySystem extends EventTarget {
         }
 
         const chunk = textDecoder.decode(value, { stream: true });
-#新增修改
+        // 新增修改
         buffer += chunk;
 
         // 简单的 JSON 流解析逻辑
