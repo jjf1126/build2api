@@ -409,7 +409,8 @@ class ProxySystem extends EventTarget {
 
       const reader = response.body.getReader();
       const textDecoder = new TextDecoder();
-      let fullBody = "";
+      let buffer = "";
+      let isThinking = false;
       let firstChunkReceived = false;
 
       while (true) {
@@ -417,90 +418,69 @@ class ProxySystem extends EventTarget {
         if (done) break;
 
         if (!firstChunkReceived) {
-            cancelTimeout(); // 收到第一个数据块后，取消空闲超时
+            cancelTimeout();
             firstChunkReceived = true;
         }
 
-        const chunk = textDecoder.decode(value, { stream: true });
-        // 新增修改
-        buffer += chunk;
+        buffer += textDecoder.decode(value, { stream: true });
+        
+        let newlineIndex;
+        while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
+            const line = buffer.substring(0, newlineIndex).trim();
+            buffer = buffer.substring(newlineIndex + 1);
 
-        // 持续处理缓冲区中的完整JSON对象
-        while (true) {
-            // 寻找下一个JSON对象的开始和结束
-            const startIndex = buffer.indexOf('{');
-            if (startIndex === -1) {
-                // 如果没有 '{'，清空无效的缓冲区前缀
-                if (buffer.length > 2) buffer = ""; 
-                break;
+            if (line.length === 0) continue;
+
+            let jsonStr = line;
+            if (jsonStr.startsWith('data: ')) {
+                jsonStr = jsonStr.substring(6);
             }
-            
-            // 从找到的第一个 '{' 开始匹配
-            let braceCount = 0;
-            let inString = false;
-            let endIndex = -1;
-            for (let i = startIndex; i < buffer.length; i++) {
-                const char = buffer[i];
-                if (char === '"' && (i === 0 || buffer[i-1] !== '\\')) {
-                    inString = !inString;
-                }
-                if (!inString) {
-                    if (char === '{') braceCount++;
-                    else if (char === '}') braceCount--;
-                }
-                if (braceCount === 0 && i >= startIndex) {
-                    endIndex = i + 1;
-                    break;
-                }
+            if (jsonStr.startsWith(',')) {
+                jsonStr = jsonStr.substring(1);
+            }
+            if (jsonStr === '[') {
+                continue;
+            }
+             if (jsonStr === ']') {
+                continue;
             }
 
-            if (endIndex !== -1) {
-                const jsonStr = buffer.substring(startIndex, endIndex);
-                try {
-                    const data = JSON.parse(jsonStr);
-                    
-                    // --- 核心修复：使用可选链安全地访问属性 ---
-                    const parts = data.candidates?.[0]?.content?.parts;
+            try {
+                const data = JSON.parse(jsonStr);
+                const parts = data.candidates?.[0]?.content?.parts;
 
-                    if (Array.isArray(parts)) {
-                        for (const part of parts) {
-                            const text = part.text || "";
-                            // Gemini 2.5 Pro (preview) 使用 `thought` 字段
-                            const isThoughtPart = part.thought === true;
+                if (Array.isArray(parts)) {
+                    for (const part of parts) {
+                        const thoughtText = part.thought;
+                        const regularText = part.text;
 
-                            if (isThoughtPart) {
-                                if (!isThinking) {
-                                    this._transmitChunk("\n
+                        if (thoughtText && typeof thoughtText === 'string') {
+                            if (!isThinking) {
+                                this._transmitChunk("\n
 \n", operationId);
-                                    isThinking = true;
-                                }
-                                this._transmitChunk(text, operationId);
-                            } else if (text) { // 只处理有文本的正文部分
-                                if (isThinking) {
-                                    this._transmitChunk("\n</think>\n", operationId);
-                                    isThinking = false;
-                                }
-                                this._transmitChunk(text, operationId);
+                                isThinking = true;
                             }
+                            this._transmitChunk(thoughtText, operationId);
+                        } else if (regularText) {
+                            if (isThinking) {
+                                this._transmitChunk("\n</think>\n", operationId);
+                                isThinking = false;
+                            }
+                            this._transmitChunk(regularText, operationId);
                         }
                     }
-                } catch (e) {
-                    // JSON 解析失败，可能是数据不完整或格式错误，忽略此块
-                    Logger.output("JSON 解析警告，已跳过:", e.message, "原始字符串:", jsonStr);
                 }
-                // 移除已处理的 JSON 字符串
-                buffer = buffer.substring(endIndex);
-            } else {
-                // 没有找到完整的 JSON 对象，等待更多数据
-                break;
+            } catch (e) {
+                // Not a valid JSON line, which is fine. Skip it.
+                // Logger.output("Skipping non-JSON line:", line);
             }
         }
       }
 
-      // 流结束后的清理工作
       if (isThinking) {
           this._transmitChunk("\n</think>\n", operationId);
       }
+
 
       this._transmitStreamEnd(operationId);
     } catch (error) {
