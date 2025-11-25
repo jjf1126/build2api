@@ -208,8 +208,8 @@ class RequestProcessor {
       const originalModelPart = modelPart;
       const cleanedModelPart = originalModelPart
         .replace("-search", "")
-        .replace("-maxthinking", "")
-        .replace("-nothinking", "");
+        .replace("-high", "")
+        .replace("-low", "");
 
       if (originalModelPart !== cleanedModelPart) {
         pathSegment = `${cleanedModelPart}:${actionPart}`;
@@ -261,6 +261,34 @@ class RequestProcessor {
           }
         }
 
+
+        // --- 新增模块：gemini-3-pro-preview 的 -high/-low 推理等级 ---
+        const isGemini3Preview = requestSpec.path.includes("gemini-3-pro-preview");
+        if (isGemini3Preview) {
+          // 确保 generationConfig 对象存在
+          if (!bodyObj.generationConfig) {
+            bodyObj.generationConfig = {};
+          }
+          
+          // 仅当用户没有在原始请求中提供 thinkingConfig 时，才应用后缀逻辑
+          if (!bodyObj.generationConfig.thinkingConfig) {
+            if (requestSpec.path.includes("-high:")) {
+              bodyObj.generationConfig.thinkingConfig = {
+                includeThoughts: true,
+                thinkingBudgetTokenLimit: 8192 // 高推理预算
+              };
+              Logger.output("✅ 检测到 '-high' 后缀，已应用高级推理配置。");
+            } else if (requestSpec.path.includes("-low:")) {
+              bodyObj.generationConfig.thinkingConfig = {
+                includeThoughts: true,
+                thinkingBudgetTokenLimit: 512 // 低推理预算
+              };
+              Logger.output("✅ 检测到 '-low' 后缀，已应用低级推理配置。");
+            }
+          } else {
+            Logger.output("ℹ️ 检测到用户自定义的 thinkingConfig，将忽略 -high/-low 后缀。");
+          }
+        }
         
         // --- 模块1：智能过滤 ---
         const isImageModel =
