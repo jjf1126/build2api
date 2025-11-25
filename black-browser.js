@@ -250,32 +250,23 @@ class RequestProcessor {
         let bodyObj = JSON.parse(requestSpec.body);
         const path = requestSpec.path;
         // --- 模块0：加入 "-search"等模式 ---
+        // --- 模块0：正确配置联网搜索和工具使用思考 ---
         if (requestSpec.path.includes("-search")) {
           if (!bodyObj.tools) {
             bodyObj.tools = [{
-              "google_search": {} // 使用新的工具名称
+              "google_search": {}
             }];
             Logger.output("✅ 检测到 '-search' 后缀，已为请求开启联网模式。");
           }
-        }
-
-
-        // --- 模块1：开启思考链 (Thinking) ---
-        // 自动为支持的模型开启思考功能
-        const isThinkingModel = 
-            path.includes("gemini-2.0-flash-thinking") || 
-            path.includes("gemini-2.5") || 
-            path.includes("gemini-3");
-
-        if (isThinkingModel) {
-            if (!bodyObj.generationConfig) {
-                bodyObj.generationConfig = {};
-            }
-            // 注入 thinkingConfig
-            bodyObj.generationConfig.thinkingConfig = {
-                includeThoughts: true 
+          // 这是获取工具使用思考过程的【正确】方式
+          if (!bodyObj.tool_config) {
+            bodyObj.tool_config = {
+              "tool_calling_config": {
+                "mode": "ANY" // "ANY" 强制模型考虑使用工具，这会触发思考过程的输出
+              }
             };
-            Logger.output("🧠 已为请求开启思考链模式 (Thinking Mode)");
+            Logger.output("🛠️ 已为联网模式配置 tool_config 以获取思考过程。");
+          }
         }
 
         // --- 模块1：智能过滤 ---
@@ -284,7 +275,7 @@ class RequestProcessor {
           requestSpec.path.includes("imagen");
             
         if (isImageModel) {
-          const incompatibleKeys = ["tool_config", "toolChoice", "tools", "thinkingConfig"];
+          const incompatibleKeys = ["tool_config", "toolChoice", "tools"];
           incompatibleKeys.forEach((key) => {
             if (bodyObj.hasOwnProperty(key)) delete bodyObj[key];
           });
