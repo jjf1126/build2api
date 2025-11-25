@@ -722,8 +722,25 @@ class RequestHandler {
     this.isAuthSwitching = false;
     this.needsSwitchingAfterRequest = false;
     this.isSystemBusy = false;
+    this.primaryIndices = [];
+    this.secondaryIndices = [];
+    this._initializeAccountGroups();
   }
 
+  _initializeAccountGroups() {
+    const available = [...this.authSource.availableIndices].sort(
+      (a, b) => a - b
+    );
+    this.primaryIndices = available.slice(0, 3);
+    this.secondaryIndices = available.slice(3);
+    this.logger.info(
+      `[Auth] Account groups initialized. Primary loop: [${
+        this.primaryIndices.join(", ") || "None"
+      }], Secondary pool: [${this.secondaryIndices.join(", ") || "None"}]`
+    );
+  }
+
+  
   get currentAuthIndex() {
     return this.browserManager.currentAuthIndex;
   }
@@ -733,14 +750,25 @@ class RequestHandler {
   }
 
   _getNextAuthIndex() {
-    const available = this.authSource.availableIndices; 
-    if (available.length === 0) return null;
+    // This method now exclusively handles the primary account loop.
+    const available = this.primaryIndices;
+    if (available.length === 0) {
+      this.logger.warn(
+        "[Auth] Attempted to get next index, but no primary accounts are configured."
+      );
+      // Fallback to all available accounts if primary is empty
+      const allAvailable = this.authSource.availableIndices;
+      if (allAvailable.length === 0) return null;
+      const currentIndexInAll = allAvailable.indexOf(this.currentAuthIndex);
+      const nextIndexInAll = (currentIndexInAll + 1) % allAvailable.length;
+      return allAvailable[nextIndexInAll];
+    }
 
     const currentIndexInArray = available.indexOf(this.currentAuthIndex);
 
     if (currentIndexInArray === -1) {
       this.logger.warn(
-        `[Auth] 当前索引 ${this.currentAuthIndex} 不在可用列表中，将切换到第一个可用索引。`
+        `[Auth] Current index ${this.currentAuthIndex} is not in the primary loop. Defaulting to the first primary account.`
       );
       return available[0];
     }
@@ -896,36 +924,60 @@ class RequestHandler {
     if (isImmediateSwitch || isThresholdReached) {
       if (isImmediateSwitch) {
         this.logger.warn(
-          `🔴 [Auth] 收到状态码 ${errorDetails.status}，触发立即切换账号...`
+          `🔴 [Auth] 收到状态码 ${errorDetails.status}，触发立即切换到随机后备账号...`
         );
+        try {
+          if (this.secondaryIndices.length > 0) {
+            const targetIndex =
+              this.secondaryIndices[
+                Math.floor(Math.random() * this.secondaryIndices.length)
+              ];
+            this.logger.info(`[Auth] 已随机选择后备账号 #${targetIndex}。`);
+            await this._switchToSpecificAuth(targetIndex);
+          } else {
+            this.logger.warn(
+              `[Auth] 没有可用的后备账号 (4+)，将执行标准轮换。`
+            );
+            await this._switchToNextAuth();
+          }
+          const successMessage = `🔄 触发紧急切换，已切换到账号 #${this.currentAuthIndex}。`;
+          this.logger.info(`[Auth] ${successMessage}`);
+          if (res) this._sendErrorChunkToClient(res, successMessage);
+        } catch (error) {
+          let userMessage = `❌ 致命错误：发生未知切换错误: ${error.message}`;
+          this.logger.error(
+            `[Auth] 后台账号切换任务最终失败: ${error.message}`
+          );
+          if (res) this._sendErrorChunkToClient(res, userMessage);
+        }
       } else {
         this.logger.warn(
           `🔴 [Auth] 达到失败阈值 (${this.failureCount}/${this.config.failureThreshold})！准备切换账号...`
         );
-      }
+        try {
+          await this._switchToNextAuth();
+          const successMessage = `🔄 目标账户无效，已自动回退至账号 #${this.currentAuthIndex}。`;
+          this.logger.info(`[Auth] ${successMessage}`);
+          if (res) this._sendErrorChunkToClient(res, successMessage);
+        } catch (error) {
+          let userMessage = `❌ 致命错误：发生未知切换错误: ${error.message}`;
 
-      try {
-        await this._switchToNextAuth();
-        const successMessage = `🔄 目标账户无效，已自动回退至账号 #${this.currentAuthIndex}。`;
-        this.logger.info(`[Auth] ${successMessage}`);
-        if (res) this._sendErrorChunkToClient(res, successMessage);
-      } catch (error) {
-        let userMessage = `❌ 致命错误：发生未知切换错误: ${error.message}`;
+          if (error.message.includes("Only one account is available")) {
+            userMessage = "❌ 切换失败：只有一个可用账号。";
+            this.logger.info("[Auth] 只有一个可用账号，失败计数已重置。");
+            this.failureCount = 0;
+          } else if (error.message.includes("回退失败原因")) {
+            userMessage = `❌ 致命错误：自动切换和紧急回退均失败，服务可能已中断，请检查日志！`;
+          } else if (error.message.includes("切换到账号")) {
+            userMessage = `⚠️ 自动切换失败：已自动回退到账号 #${this.currentAuthIndex}，请检查目标账号是否存在问题。`;
+          }
 
-        if (error.message.includes("Only one account is available")) {
-          userMessage = "❌ 切换失败：只有一个可用账号。";
-          this.logger.info("[Auth] 只有一个可用账号，失败计数已重置。");
-          this.failureCount = 0;
-        } else if (error.message.includes("回退失败原因")) {
-          userMessage = `❌ 致命错误：自动切换和紧急回退均失败，服务可能已中断，请检查日志！`;
-        } else if (error.message.includes("切换到账号")) {
-          userMessage = `⚠️ 自动切换失败：已自动回退到账号 #${this.currentAuthIndex}，请检查目标账号是否存在问题。`;
+          this.logger.error(
+            `[Auth] 后台账号切换任务最终失败: ${error.message}`
+          );
+          if (res) this._sendErrorChunkToClient(res, userMessage);
         }
-
-        this.logger.error(`[Auth] 后台账号切换任务最终失败: ${error.message}`);
-        if (res) this._sendErrorChunkToClient(res, userMessage);
       }
-
       return;
     }
   }
@@ -1032,13 +1084,35 @@ class RequestHandler {
         this.logger.info(
           `[Auth] 轮换计数已达到切换阈值 (${this.usageCount}/${this.config.switchOnUses})，将在后台自动切换账号...`
         );
-        this._switchToNextAuth().catch((err) => {
-          this.logger.error(`[Auth] 后台账号切换任务失败: ${err.message}`);
-        });
+        const currentIsSecondary = this.secondaryIndices.includes(
+          this.currentAuthIndex
+        );
+
+        if (currentIsSecondary) {
+          this.logger.info(
+            "[Auth] 当前为后备账号，使用次数达到阈值，将切换回主循环。"
+          );
+          const targetIndex = this.primaryIndices[0];
+          if (targetIndex !== undefined) {
+            this._switchToSpecificAuth(targetIndex).catch((err) => {
+              this.logger.error(
+                `[Auth] 后台切换回主循环任务失败: ${err.message}`
+              );
+            });
+          } else {
+            this.logger.error(
+              "[Auth] 无法切换回主循环：未找到任何主账号。"
+            );
+          }
+        } else {
+          // Standard rotation within the primary loop
+          this._switchToNextAuth().catch((err) => {
+            this.logger.error(`[Auth] 后台账号切换任务失败: ${err.message}`);
+          });
+        }
         this.needsSwitchingAfterRequest = false;
       }
     }
-  }
 
   async processOpenAIRequest(req, res) {
     const requestId = this._generateRequestId();
@@ -1262,18 +1336,42 @@ class RequestHandler {
       this.connectionRegistry.removeMessageQueue(requestId);
       if (this.needsSwitchingAfterRequest) {
         this.logger.info(
-          `[Auth] OpenAI轮换计数已达到切换阈值 (${this.usageCount}/${this.config.switchOnUses})，将在后台自动切换账号...`
+          `[Auth] OpenAI轮换计数已达到切换阈值 (${this.usageCount}/${
+            this.config.switchOnUses
+          })，将在后台自动切换账号...`
         );
-        this._switchToNextAuth().catch((err) => {
-          this.logger.error(`[Auth] 后台账号切换任务失败: ${err.message}`);
-        });
+        const currentIsSecondary = this.secondaryIndices.includes(
+          this.currentAuthIndex
+        );
+
+        if (currentIsSecondary) {
+          this.logger.info(
+            "[Auth] 当前为后备账号，使用次数达到阈值，将切换回主循环。"
+          );
+          const targetIndex = this.primaryIndices[0];
+          if (targetIndex !== undefined) {
+            this._switchToSpecificAuth(targetIndex).catch((err) => {
+              this.logger.error(
+                `[Auth] 后台切换回主循环任务失败: ${err.message}`
+              );
+            });
+          } else {
+            this.logger.error(
+              "[Auth] 无法切换回主循环：未找到任何主账号。"
+            );
+          }
+        } else {
+          // Standard rotation within the primary loop
+          this._switchToNextAuth().catch((err) => {
+            this.logger.error(`[Auth] 后台账号切换任务失败: ${err.message}`);
+          });
+        }
         this.needsSwitchingAfterRequest = false;
       }
       if (!res.writableEnded) {
         res.end();
       }
     }
-  }
 
   async processModelListRequest(req, res) {
     const requestId = this._generateRequestId();
