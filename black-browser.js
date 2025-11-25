@@ -425,63 +425,59 @@ class ProxySystem extends EventTarget {
         // 新增修改
         buffer += chunk;
 
-        // 简单的 JSON 流解析逻辑
+        // 持续处理缓冲区中的完整JSON对象
         while (true) {
-            // 清理 buffer 开头的非 JSON 字符（Google 流通常以 '[' 开头，中间用 ',' 分隔）
-            buffer = buffer.trimStart();
-            if (buffer.startsWith(",")) buffer = buffer.substring(1).trimStart();
-            if (buffer.startsWith("[")) buffer = buffer.substring(1).trimStart();
-            if (buffer.startsWith("]")) buffer = buffer.substring(1).trimStart();
-
-            if (buffer.length === 0) break;
-
-            if (!buffer.startsWith("{")) {
-                // 如果不是以 { 开头，可能是残留的字符或格式错误，暂时跳过等待更多数据
-                // 但为了防止死循环，如果长度很长还找不到 {，可能需要丢弃
-                if (buffer.length > 5 && !buffer.includes("{")) {
-                     buffer = ""; 
-                }
-                break; 
+            // 寻找下一个JSON对象的开始和结束
+            const startIndex = buffer.indexOf('{');
+            if (startIndex === -1) {
+                // 如果没有 '{'，清空无效的缓冲区前缀
+                if (buffer.length > 2) buffer = ""; 
+                break;
             }
-
-            // 尝试寻找完整的 JSON 对象
+            
+            // 从找到的第一个 '{' 开始匹配
             let braceCount = 0;
             let inString = false;
-            let parseIndex = -1;
-
-            for (let i = 0; i < buffer.length; i++) {
+            let endIndex = -1;
+            for (let i = startIndex; i < buffer.length; i++) {
                 const char = buffer[i];
-                if (char === '"' && buffer[i - 1] !== '\\') {
+                if (char === '"' && (i === 0 || buffer[i-1] !== '\\')) {
                     inString = !inString;
                 }
                 if (!inString) {
                     if (char === '{') braceCount++;
                     else if (char === '}') braceCount--;
                 }
-                if (braceCount === 0 && i > 0) {
-                    parseIndex = i + 1;
+                if (braceCount === 0 && i >= startIndex) {
+                    endIndex = i + 1;
                     break;
                 }
             }
 
-            if (parseIndex !== -1) {
-                const jsonStr = buffer.substring(0, parseIndex);
+            if (endIndex !== -1) {
+                const jsonStr = buffer.substring(startIndex, endIndex);
                 try {
                     const data = JSON.parse(jsonStr);
                     
-                    // 解析成功，处理数据
-                    if (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) {
-                        const parts = data.candidates[0].content.parts;
+                    // --- 核心修复：使用可选链安全地访问属性 ---
+                    const parts = data.candidates?.[0]?.content?.parts;
+
+                    if (Array.isArray(parts)) {
                         for (const part of parts) {
-                            // 检查是否是思考内容
-                            // Google API 可能通过 thought: true 标记，或者我们需要根据模型行为判断
-                            const isThoughtPart = part.thought === true;
                             const text = part.text || "";
+                            // Gemini 2.5 Pro (preview) 使用 `thought` 字段
+                            const isThoughtPart = part.thought === true;
 
                             if (isThoughtPart) {
                                 if (!isThinking) {
                                     this._transmitChunk("\n
 \n", operationId);
+                                    isThinking = true;
+                                }
+                                this._transmitChunk(text, operationId);
+                            } else if (text) { // 只处理有文本的正文部分
+                                if (isThinking) {
+                                    this._transmitChunk("\n</think>\n", operationId);
                                     isThinking = false;
                                 }
                                 this._transmitChunk(text, operationId);
@@ -489,10 +485,11 @@ class ProxySystem extends EventTarget {
                         }
                     }
                 } catch (e) {
-                    // JSON 解析失败，忽略
+                    // JSON 解析失败，可能是数据不完整或格式错误，忽略此块
+                    Logger.output("JSON 解析警告，已跳过:", e.message, "原始字符串:", jsonStr);
                 }
-                // 移除已处理的 JSON
-                buffer = buffer.substring(parseIndex);
+                // 移除已处理的 JSON 字符串
+                buffer = buffer.substring(endIndex);
             } else {
                 // 没有找到完整的 JSON 对象，等待更多数据
                 break;
@@ -500,7 +497,7 @@ class ProxySystem extends EventTarget {
         }
       }
 
-      // 流结束后的清理
+      // 流结束后的清理工作
       if (isThinking) {
           this._transmitChunk("\n</think>\n", operationId);
       }
