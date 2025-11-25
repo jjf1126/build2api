@@ -422,16 +422,87 @@ class ProxySystem extends EventTarget {
         }
 
         const chunk = textDecoder.decode(value, { stream: true });
+#新增修改
+        buffer += chunk;
 
-        if (requestSpec.streaming_mode === "real") {
-          this._transmitChunk(chunk, operationId);
-        } else {
-          fullBody += chunk;
+        // 简单的 JSON 流解析逻辑
+        while (true) {
+            // 清理 buffer 开头的非 JSON 字符（Google 流通常以 '[' 开头，中间用 ',' 分隔）
+            buffer = buffer.trimStart();
+            if (buffer.startsWith(",")) buffer = buffer.substring(1).trimStart();
+            if (buffer.startsWith("[")) buffer = buffer.substring(1).trimStart();
+            if (buffer.startsWith("]")) buffer = buffer.substring(1).trimStart();
+
+            if (buffer.length === 0) break;
+
+            if (!buffer.startsWith("{")) {
+                // 如果不是以 { 开头，可能是残留的字符或格式错误，暂时跳过等待更多数据
+                // 但为了防止死循环，如果长度很长还找不到 {，可能需要丢弃
+                if (buffer.length > 5 && !buffer.includes("{")) {
+                     buffer = ""; 
+                }
+                break; 
+            }
+
+            // 尝试寻找完整的 JSON 对象
+            let braceCount = 0;
+            let inString = false;
+            let parseIndex = -1;
+
+            for (let i = 0; i < buffer.length; i++) {
+                const char = buffer[i];
+                if (char === '"' && buffer[i - 1] !== '\\') {
+                    inString = !inString;
+                }
+                if (!inString) {
+                    if (char === '{') braceCount++;
+                    else if (char === '}') braceCount--;
+                }
+                if (braceCount === 0 && i > 0) {
+                    parseIndex = i + 1;
+                    break;
+                }
+            }
+
+            if (parseIndex !== -1) {
+                const jsonStr = buffer.substring(0, parseIndex);
+                try {
+                    const data = JSON.parse(jsonStr);
+                    
+                    // 解析成功，处理数据
+                    if (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) {
+                        const parts = data.candidates[0].content.parts;
+                        for (const part of parts) {
+                            // 检查是否是思考内容
+                            // Google API 可能通过 thought: true 标记，或者我们需要根据模型行为判断
+                            const isThoughtPart = part.thought === true;
+                            const text = part.text || "";
+
+                            if (isThoughtPart) {
+                                if (!isThinking) {
+                                    this._transmitChunk("\n
+\n", operationId);
+                                    isThinking = false;
+                                }
+                                this._transmitChunk(text, operationId);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // JSON 解析失败，忽略
+                }
+                // 移除已处理的 JSON
+                buffer = buffer.substring(parseIndex);
+            } else {
+                // 没有找到完整的 JSON 对象，等待更多数据
+                break;
+            }
         }
       }
 
-      if (requestSpec.streaming_mode !== "real") {
-        this._transmitChunk(fullBody, operationId);
+      // 流结束后的清理
+      if (isThinking) {
+          this._transmitChunk("\n</think>\n", operationId);
       }
 
       this._transmitStreamEnd(operationId);
