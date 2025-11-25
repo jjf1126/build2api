@@ -262,33 +262,38 @@ class RequestProcessor {
         }
 
 
-        // --- 新增模块：gemini-3-pro-preview 的 -high/-low 推理等级 ---
+        // --- 新增模块：gemini-3-pro-preview 的高级功能 ---
         const isGemini3Preview = requestSpec.path.includes("gemini-3-pro-preview");
         if (isGemini3Preview) {
-          // 确保 generationConfig 对象存在
+          // 1. 默认开启 URL Context 功能 (如果用户未提供)
+          if (!bodyObj.context) {
+            bodyObj.context = { urls: [] };
+            Logger.output("✅ Gemini 3 Preview: 已默认开启 URL context 功能。");
+          }
+
+          // 2. 处理 -high/-low 推理等级后缀
           if (!bodyObj.generationConfig) {
             bodyObj.generationConfig = {};
           }
-          
-          // 仅当用户没有在原始请求中提供 thinkingConfig 时，才应用后缀逻辑
           if (!bodyObj.generationConfig.thinkingConfig) {
             if (requestSpec.path.includes("-high")) {
               bodyObj.generationConfig.thinkingConfig = {
                 includeThoughts: true,
-                thinkingBudgetTokenLimit: 8192 // 高推理预算
+                thinkingLevel: 'high' // 直接设置推理等级
               };
-              Logger.output("✅ 检测到 '-high' 后缀，已应用高级推理配置。");
+              Logger.output("✅ 检测到 '-high' 后缀，已设置推理等级为 'high'。");
             } else if (requestSpec.path.includes("-low")) {
               bodyObj.generationConfig.thinkingConfig = {
                 includeThoughts: true,
-                thinkingBudgetTokenLimit: 512 // 低推理预算
+                thinkingLevel: 'low' // 直接设置推理等级
               };
-              Logger.output("✅ 检测到 '-low' 后缀，已应用低级推理配置。");
+              Logger.output("✅ 检测到 '-low' 后缀，已设置推理等级为 'low'。");
             }
           } else {
             Logger.output("ℹ️ 检测到用户自定义的 thinkingConfig，将忽略 -high/-low 后缀。");
           }
         }
+
         
         // --- 模块1：智能过滤 ---
         const isImageModel =
