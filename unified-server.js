@@ -2152,7 +2152,8 @@ class ProxyServerSystem extends EventEmitter {
     this.logger = new LoggingService("ProxySystem");
     this._loadConfiguration(); 
     this.streamingMode = this.config.streamingMode;
-    this.forceThinking = false;
+    // 修改此处：将 false 改为 true，默认开启强制推理
+    this.forceThinking = true;
 
     this.authSource = new AuthSource(this.logger);
     this.browserManager = new BrowserManager(
