@@ -731,13 +731,26 @@ class RequestHandler {
     const available = [...this.authSource.availableIndices].sort(
       (a, b) => a - b
     );
+    // 优先账号：前3个
     this.primaryIndices = available.slice(0, 3);
+    
+    // 剩余账号：用于判断当前是否为后备账号
     this.secondaryIndices = available.slice(3);
+    
+    // 后备分组逻辑：剩余账号按 2-3 个一组进行分组
+    this.secondaryGroups = [];
+    const remaining = [...this.secondaryIndices];
+    
+    // 这里采用每组3个的策略（满足2-3个一组的要求），不足3个的自动成为最后一组
+    while (remaining.length > 0) {
+      this.secondaryGroups.push(remaining.splice(0, 3));
+    }
+
     this.logger.info(
-      `[Auth] Account groups initialized. Primary loop: [${
-        this.primaryIndices.join(", ") || "None"
-      }], Secondary pool: [${this.secondaryIndices.join(", ") || "None"}]`
+      `[Auth] 账号分组初始化完成。`
     );
+    this.logger.info(`   • 主循环组 (1-3): [${this.primaryIndices.join(", ") || "None"}]`);
+    this.logger.info(`   • 后备分组 (每组2-3个): ${JSON.stringify(this.secondaryGroups)}`);
   }
 
   
@@ -924,25 +937,48 @@ class RequestHandler {
     if (isImmediateSwitch || isThresholdReached) {
       if (isImmediateSwitch) {
         this.logger.warn(
-          `🔴 [Auth] 收到状态码 ${errorDetails.status}，触发立即切换到随机后备账号...`
+          `🔴 [Auth] 收到状态码 ${errorDetails.status}，触发分组切换逻辑...`
         );
+        
+        // 判断当前账号是否在主分组 (1-3)
+        const isCurrentPrimary = this.primaryIndices.includes(this.currentAuthIndex);
+
         try {
-          if (this.secondaryIndices.length > 0) {
-            const targetIndex =
-              this.secondaryIndices[
-                Math.floor(Math.random() * this.secondaryIndices.length)
-              ];
-            this.logger.info(`[Auth] 已随机选择后备账号 #${targetIndex}。`);
-            await this._switchToSpecificAuth(targetIndex);
+          if (isCurrentPrimary) {
+            // === 场景 A: 主分组报错 -> 随机去一个后备组 ===
+            if (this.secondaryGroups.length > 0) {
+              // 1. 随机选一个组
+              const randomGroup = this.secondaryGroups[Math.floor(Math.random() * this.secondaryGroups.length)];
+              // 2. 从该组中随机选一个账号
+              const targetIndex = randomGroup[Math.floor(Math.random() * randomGroup.length)];
+              
+              this.logger.info(`[Auth] 主分组遇到立即切换错误，随机切换到后备组账号 #${targetIndex}。`);
+              await this._switchToSpecificAuth(targetIndex);
+            } else {
+              this.logger.warn(
+                `[Auth] 没有可用的后备分组 (4+)，将继续在主分组内执行标准轮换。`
+              );
+              await this._switchToNextAuth();
+            }
           } else {
+            // === 场景 B: 后备组报错 -> 回到主分组 (1-3) ===
             this.logger.warn(
-              `[Auth] 没有可用的后备账号 (4+)，将执行标准轮换。`
+              `[Auth] 后备账号 #${this.currentAuthIndex} 遇到立即切换错误，重新开始使用主分组 (1-3)...`
             );
-            await this._switchToNextAuth();
+            // 切换回主分组的第一个账号
+            const targetIndex = this.primaryIndices[0];
+            if (targetIndex !== undefined) {
+               await this._switchToSpecificAuth(targetIndex);
+            } else {
+               // 理论上不会发生，除非没有主账号
+               await this._switchToNextAuth();
+            }
           }
+
           const successMessage = `🔄 触发紧急切换，已切换到账号 #${this.currentAuthIndex}。`;
           this.logger.info(`[Auth] ${successMessage}`);
           if (res) this._sendErrorChunkToClient(res, successMessage);
+
         } catch (error) {
           let userMessage = `❌ 致命错误：发生未知切换错误: ${error.message}`;
           this.logger.error(
@@ -951,6 +987,7 @@ class RequestHandler {
           if (res) this._sendErrorChunkToClient(res, userMessage);
         }
       } else {
+        // 普通的失败阈值轮换 (非立即切换码)
         this.logger.warn(
           `🔴 [Auth] 达到失败阈值 (${this.failureCount}/${this.config.failureThreshold})！准备切换账号...`
         );
@@ -960,18 +997,12 @@ class RequestHandler {
           this.logger.info(`[Auth] ${successMessage}`);
           if (res) this._sendErrorChunkToClient(res, successMessage);
         } catch (error) {
+          // ... (保持原有的错误处理逻辑) ...
           let userMessage = `❌ 致命错误：发生未知切换错误: ${error.message}`;
-
           if (error.message.includes("Only one account is available")) {
             userMessage = "❌ 切换失败：只有一个可用账号。";
-            this.logger.info("[Auth] 只有一个可用账号，失败计数已重置。");
             this.failureCount = 0;
-          } else if (error.message.includes("回退失败原因")) {
-            userMessage = `❌ 致命错误：自动切换和紧急回退均失败，服务可能已中断，请检查日志！`;
-          } else if (error.message.includes("切换到账号")) {
-            userMessage = `⚠️ 自动切换失败：已自动回退到账号 #${this.currentAuthIndex}，请检查目标账号是否存在问题。`;
           }
-
           this.logger.error(
             `[Auth] 后台账号切换任务最终失败: ${error.message}`
           );
