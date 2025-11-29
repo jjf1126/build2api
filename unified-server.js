@@ -722,6 +722,7 @@ class RequestHandler {
     this.isAuthSwitching = false;
     this.needsSwitchingAfterRequest = false;
     this.isSystemBusy = false;
+    this.failedIndicesInCurrentGroup = new Set();
     this.primaryIndices = [];
     this.secondaryIndices = [];
     this._initializeAccountGroups();
@@ -736,38 +737,32 @@ class RequestHandler {
     const total = available.length;
     let i = 0;
 
-    // 分组算法：
-    // 1. 优先切分3个一组。
-    // 2. 每次切分前检查剩余数量。如果刚好剩4个，则强制分为 [2, 2] 两组，避免最后出现单账号组。
-    // 3. 其他情况（剩3个、2个、1个或0个）直接切分剩余所有（slice会自动处理越界）。
+    // 分组算法：优先3个一组，剩余4个时分2+2
     while (i < total) {
         const remaining = total - i;
-        
         if (remaining === 4) {
-            // 特殊情况：剩余4个，分为 2 + 2
             this.accountGroups.push(available.slice(i, i + 2));
             i += 2;
             this.accountGroups.push(available.slice(i, i + 2));
             i += 2;
-            break; // 4个处理完肯定结束了
+            break;
         } else {
-            // 标准情况：尝试切分3个
-            // 如果剩余不足3个 (例如2个)，slice(i, i+3) 会直接取到末尾，符合"不足2个则最后两组..."的逻辑变体(即最后一组2个)
             this.accountGroups.push(available.slice(i, i + 3));
             i += 3;
         }
     }
 
-    // 防止空数组（无账号时）
     if (this.accountGroups.length === 0) {
         this.accountGroups.push([]);
     }
 
-    // 初始化当前组索引
     this.currentGroupIndex = 0;
     this._syncGroupIndexWithCurrentAuth();
+    
+    // 初始化时清空失败记录
+    this.failedIndicesInCurrentGroup.clear();
 
-    this.logger.info(`[Auth] 账号分组初始化完成 (模式: 3个一组，末尾自动平衡)。`);
+    this.logger.info(`[Auth] 账号分组初始化完成 (模式: 3个一组，组内轮换，组间故障转移)。`);
     this.accountGroups.forEach((group, index) => {
         this.logger.info(`   • 第 ${index + 1} 组: [${group.join(", ")}]`);
     });
@@ -813,7 +808,34 @@ class RequestHandler {
     const nextIndexInGroup = (currentIndexInGroup + 1) % currentGroup.length;
     return currentGroup[nextIndexInGroup];
   }
+  
+  // 新增：原地重启当前账号（用于达到使用次数阈值）
+  async _restartCurrentAuth() {
+    if (this.isAuthSwitching) return;
+    this.isSystemBusy = true;
+    this.isAuthSwitching = true;
 
+    const targetIndex = this.currentAuthIndex;
+    this.logger.info("==================================================");
+    this.logger.info(`🔄 [Auth] 达到使用次数阈值，正在执行原地重启(Refresh)...`);
+    this.logger.info(`   • 目标账号: #${targetIndex}`);
+    this.logger.info("==================================================");
+
+    try {
+      await this.browserManager.launchOrSwitchContext(targetIndex);
+      this.failureCount = 0;
+      this.usageCount = 0;
+      this.logger.info(`✅ [Auth] 账号 #${targetIndex} 重启成功，计数已清零。`);
+      return { success: true };
+    } catch (error) {
+      this.logger.error(`❌ [Auth] 账号重启失败: ${error.message}`);
+      throw error;
+    } finally {
+      this.isAuthSwitching = false;
+      this.isSystemBusy = false;
+    }
+  }
+  
   async _switchToNextAuth() {
     const available = this.authSource.availableIndices;
 
@@ -961,39 +983,67 @@ class RequestHandler {
     if (isImmediateSwitch || isThresholdReached) {
       if (isImmediateSwitch) {
         this.logger.warn(
-          `🔴 [Auth] 收到立即切换状态码 ${errorDetails.status}，触发【整组切换】逻辑...`
+          `🔴 [Auth] 收到立即切换状态码 ${errorDetails.status}，触发故障转移逻辑...`
         );
         
         try {
-            // === 组切换逻辑 ===
-            const prevGroupIndex = this.currentGroupIndex;
-            // 组索引 + 1，取模实现循环（最后一组 -> 第一组）
-            this.currentGroupIndex = (this.currentGroupIndex + 1) % this.accountGroups.length;
+            // 1. 标记当前账号为“本轮已失败”
+            this.failedIndicesInCurrentGroup.add(this.currentAuthIndex);
             
-            const nextGroup = this.accountGroups[this.currentGroupIndex];
-            const targetIndex = nextGroup[0]; // 切换到新组的第一个账号
+            const currentGroup = this.accountGroups[this.currentGroupIndex];
+            
+            // 2. 检查当前组是否全军覆没
+            const isGroupExhausted = currentGroup.every(idx => this.failedIndicesInCurrentGroup.has(idx));
 
-            this.logger.info(
-                `🔄 [Auth] 执行组切换: 第 ${prevGroupIndex + 1} 组 -> 第 ${this.currentGroupIndex + 1} 组 (目标账号 #${targetIndex})`
-            );
+            let targetIndex;
+            let switchReason = "";
+
+            if (isGroupExhausted) {
+                // === 情况A: 组内所有账号都挂了 -> 切换到下一组 ===
+                const prevGroupIndex = this.currentGroupIndex;
+                this.currentGroupIndex = (this.currentGroupIndex + 1) % this.accountGroups.length;
+                
+                // 到了新组，清空失败记录
+                this.failedIndicesInCurrentGroup.clear();
+                
+                const nextGroup = this.accountGroups[this.currentGroupIndex];
+                targetIndex = nextGroup[0]; // 新组的第一个
+                switchReason = `当前组(第${prevGroupIndex + 1}组)所有账号均已失效，切换至第 ${this.currentGroupIndex + 1} 组`;
+            } else {
+                // === 情况B: 组内还有幸存者 -> 切换到组内下一个未失败的账号 ===
+                const currentIdxInGroup = currentGroup.indexOf(this.currentAuthIndex);
+                
+                // 寻找下一个未在 failedIndicesInCurrentGroup 中的账号
+                for (let i = 1; i < currentGroup.length; i++) {
+                    const candidateIndex = currentGroup[(currentIdxInGroup + i) % currentGroup.length];
+                    if (!this.failedIndicesInCurrentGroup.has(candidateIndex)) {
+                        targetIndex = candidateIndex;
+                        break;
+                    }
+                }
+                // 理论上不会找不到，因为已检查 !isGroupExhausted
+                if (targetIndex === undefined) targetIndex = currentGroup[0]; 
+                
+                switchReason = `当前账号遇到错误，切换至组内下一个可用账号`;
+            }
+
+            this.logger.info(`🔄 [Auth] ${switchReason} (目标账号 #${targetIndex})`);
 
             await this._switchToSpecificAuth(targetIndex);
 
-            const successMessage = `🔄 触发组级切换，已轮换至第 ${this.currentGroupIndex + 1} 组 (账号 #${targetIndex})。`;
+            const successMessage = `🔄 ${switchReason} (账号 #${targetIndex})。`;
             this.logger.info(`[Auth] ${successMessage}`);
             if (res) this._sendErrorChunkToClient(res, successMessage);
 
         } catch (error) {
           let userMessage = `❌ 致命错误：发生未知切换错误: ${error.message}`;
-          this.logger.error(
-            `[Auth] 后台账号切换任务最终失败: ${error.message}`
-          );
+          this.logger.error(`[Auth] 后台账号切换任务最终失败: ${error.message}`);
           if (res) this._sendErrorChunkToClient(res, userMessage);
         }
       } else {
-        // 普通失败阈值 -> 组内切换
+        // 普通失败阈值 (非立即切换码) -> 保持原有的组内轮换逻辑 (不标记失败)
         this.logger.warn(
-          `🔴 [Auth] 达到失败阈值 (${this.failureCount}/${this.config.failureThreshold})！准备在当前组内切换账号...`
+          `🔴 [Auth] 达到失败阈值 (${this.failureCount}/${this.config.failureThreshold})！准备在当前组内轮换...`
         );
         try {
           await this._switchToNextAuth(); 
@@ -1109,20 +1159,22 @@ class RequestHandler {
       this._handleRequestError(error, res);
     } finally {
       this.connectionRegistry.removeMessageQueue(requestId);
+      
+      // === 修改点：达到使用次数阈值后，执行原地重启 ===
       if (this.needsSwitchingAfterRequest) {
         this.logger.info(
-          `[Auth] 轮换计数已达到切换阈值 (${this.usageCount}/${this.config.switchOnUses})，将在后台执行组内账号轮换...`
+          `[Auth] 轮换计数已达到切换阈值 (${this.usageCount}/${this.config.switchOnUses})，将在后台执行账号原地重启...`
         );
         
-        // 简化为直接调用 _switchToNextAuth，它现在已经是组内轮换逻辑了
-        this._switchToNextAuth().catch((err) => {
-            this.logger.error(`[Auth] 后台账号切换任务失败: ${err.message}`);
+        // 调用新定义的 _restartCurrentAuth 方法
+        this._restartCurrentAuth().catch((err) => {
+            this.logger.error(`[Auth] 后台账号重启任务失败: ${err.message}`);
         });
 
         this.needsSwitchingAfterRequest = false;
       }
     }
-  } 
+  }
 
   async processOpenAIRequest(req, res) {
     const requestId = this._generateRequestId();
@@ -1344,45 +1396,27 @@ class RequestHandler {
       this._handleRequestError(error, res);
     } finally {
       this.connectionRegistry.removeMessageQueue(requestId);
+
+      // === 修改点：达到使用次数阈值后，执行原地重启 ===
       if (this.needsSwitchingAfterRequest) {
         this.logger.info(
           `[Auth] OpenAI轮换计数已达到切换阈值 (${this.usageCount}/${
             this.config.switchOnUses
-          })，将在后台自动切换账号...`
+          })，将在后台执行账号原地重启...`
         );
-        const currentIsSecondary = this.secondaryIndices.includes(
-          this.currentAuthIndex
-        );
+        
+        // 调用新定义的 _restartCurrentAuth 方法
+        this._restartCurrentAuth().catch((err) => {
+            this.logger.error(`[Auth] 后台账号重启任务失败: ${err.message}`);
+        });
 
-        if (currentIsSecondary) {
-          this.logger.info(
-            "[Auth] 当前为后备账号，使用次数达到阈值，将切换回主循环。"
-          );
-          const targetIndex = this.primaryIndices[0];
-          if (targetIndex !== undefined) {
-            this._switchToSpecificAuth(targetIndex).catch((err) => {
-              this.logger.error(
-                `[Auth] 后台切换回主循环任务失败: ${err.message}`
-              );
-            });
-          } else {
-            this.logger.error(
-              "[Auth] 无法切换回主循环：未找到任何主账号。"
-            );
-          }
-        } else {
-          // Standard rotation within the primary loop
-          this._switchToNextAuth().catch((err) => {
-            this.logger.error(`[Auth] 后台账号切换任务失败: ${err.message}`);
-          });
-        }
         this.needsSwitchingAfterRequest = false;
       }
       if (!res.writableEnded) {
         res.end();
       }
     }
-  } 
+  }
   
   async processModelListRequest(req, res) {
     const requestId = this._generateRequestId();
